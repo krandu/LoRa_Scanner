@@ -53,35 +53,27 @@ jobs:
           arduino-cli lib install "LoRa"
           arduino-cli lib install "ESP8266 and ESP32 OLED driver for SSD1306 displays"
 
-      # ── 7. 覆盖默认分区表并编译（使用标准 esp32 FQBN）─────────
+      # ── 7. 编译项目 ──────────────────────────────────────────
       - name: Compile sketch
         run: |
-          # 使用官方 esp32 包中的 heltec_wifi_lora_32_V2 FQBN
           FQBN="esp32:esp32:heltec_wifi_lora_32_V2"
           echo "FQBN=$FQBN" >> $GITHUB_ENV
-          echo "Using FQBN: $FQBN"
 
-          # 覆盖开发板默认的分区表
+          # 覆盖默认分区表（如果存在）
           PART_DIR=$(find /home/runner/.arduino15/packages/esp32/hardware/esp32/ -type d -name "partitions" | head -1)
-          if [ -d "$PART_DIR" ]; then
+          if [ -d "$PART_DIR" ] && [ -f "spiffs/partitions.csv" ]; then
             echo "Copying custom partitions.csv to $PART_DIR/default.csv"
             cp spiffs/partitions.csv "$PART_DIR/default.csv"
           fi
 
-          # --warnings none 忽略第三方 C++ 溢出警告
           arduino-cli compile \
             --fqbn "$FQBN" \
             --warnings none \
             --export-binaries \
-            --build-property "upload.maximum_size=3342336" \
             --output-dir build/ \
             LoRa_Scanner/LoRa_Scanner.ino
 
-      # ── 8. 列出 build 目录内容（调试用）─────────────────────
-      - name: List build outputs
-        run: ls -lh build/
-
-      # ── 9. 生成 SPIFFS 镜像 ──────────────────────────────────
+      # ── 8. 生成 SPIFFS 镜像 ──────────────────────────────────
       - name: Generate SPIFFS image
         run: |
           mkdir -p spiffs_data
@@ -94,38 +86,44 @@ jobs:
             build/spiffs.bin \
             --page-size 256 \
             --block-size 4096
-          echo "SPIFFS image:"
-          ls -lh build/spiffs.bin
+          echo "SPIFFS image created."
 
-      # ── 10. 合并成单一可烧录固件 ─────────────────────────────
+      # ── 9. 智能搜索并合并固件 (兼容 esptool v5+) ────────────
       - name: Merge firmware (merged-firmware.bin)
         run: |
-          BOOT=$(find build/ -name "bootloader.bin"  | head -1)
-          PART=$(find build/ -name "partitions.bin"  | head -1)
-          BAPP=$(find build/ -name "boot_app0.bin"   | head -1)
-          APP=$(find build/  -name "*.ino.bin" ! -name "*bootloader*" ! -name "*partitions*" | head -1)
+          # 全局搜索 arduino 缓存和 build 目录中的 bootloader 与 partitions 文件
+          BOOT=$(find /home/runner/.arduino15/ build/ -name "*bootloader*.bin" | head -1)
+          PART=$(find build/ /home/runner/.arduino15/ -name "*.partitions.bin" -o -name "partitions.bin" | head -1)
+          BAPP=$(find /home/runner/.arduino15/ -name "boot_app0.bin" | head -1)
+          APP=$(find build/ -name "*.ino.bin" ! -name "*bootloader*" ! -name "*partitions*" | head -1)
 
-          echo "bootloader : $BOOT"
-          echo "partitions : $PART"
-          echo "boot_app0  : $BAPP"
-          echo "app        : $APP"
-          echo "spiffs     : build/spiffs.bin"
+          echo "Found bootloader : $BOOT"
+          echo "Found partitions : $PART"
+          echo "Found boot_app0  : $BAPP"
+          echo "Found app        : $APP"
+          echo "Found spiffs     : build/spiffs.bin"
 
-          esptool.py --chip esp32 merge_bin \
+          if [ -z "$BOOT" ] || [ -z "$PART" ] || [ -z "$BAPP" ]; then
+            echo "Error: Could not locate all required bin files for merging."
+            exit 1
+          fi
+
+          # 适配 esptool v5+ 新语法格式
+          esptool merge-bin \
+            --chip esp32 \
             --output build/merged-firmware.bin \
-            --flash_mode dio \
-            --flash_freq 80m \
-            --flash_size 8MB \
+            --flash-mode dio \
+            --flash-freq 80m \
+            --flash-size 8MB \
             0x1000   "$BOOT" \
             0x8000   "$PART" \
             0xe000   "$BAPP" \
-            0x10000  "$APP"  \
+            0x10000  "$APP" \
             0x670000 build/spiffs.bin
 
-          echo "=== merged-firmware.bin ==="
           ls -lh build/merged-firmware.bin
 
-      # ── 11. 上传所有产物 ─────────────────────────────────────
+      # ── 10. 上传产物 ─────────────────────────────────────────
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -133,23 +131,5 @@ jobs:
           path: |
             build/merged-firmware.bin
             build/spiffs.bin
-            build/*.ino.bin
-            build/*.ino.elf
-            build/*.ino.map
+            build/*.bin
           retention-days: 30
-
-      # ── 12. 打印固件摘要 ─────────────────────────────────────
-      - name: Firmware summary
-        run: |
-          echo "==============================="
-          echo " Firmware build summary"
-          echo "==============================="
-          for f in \
-            build/merged-firmware.bin \
-            build/spiffs.bin \
-            build/*.ino.bin; do
-            [ -f "$f" ] && printf "%-40s %s\n" "$f" "$(du -sh $f | cut -f1)"
-          done
-          echo ""
-          echo "Flash 刷写命令（merged-firmware，一键刷入）："
-          echo "  esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 921600 write_flash 0x0 merged-firmware.bin"
