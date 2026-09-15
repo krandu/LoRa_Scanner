@@ -14,7 +14,7 @@
  *    · 短按 < 1.5 s  →  解锁 / 手动切换下一个 SF·CR 组合
  *
  *  OLED 布局（128×64）：
- *    行0  频率(MHz)          SF·CR
+ *    行0  频率(MHz)         SF·CR
  *    行1  SCAN n/N BW:125k  或  LOCK RSSI:-xx
  *    行2～63  RSSI 瀑布热力图（滚动）
  *    行54 解码成功时显示 Payload 前缀
@@ -22,9 +22,6 @@
  */
 
 #include "heltec.h"
-#include <SPI.h>
-#include <LoRa.h>
-#include "SSD1306Wire.h"  // 或 #include <heltec.h>
 
 // ============================================================
 //  可调参数
@@ -48,9 +45,9 @@ static const unsigned long DRAW_MS        =  100;
 // ============================================================
 static const long FREQ_LIST[] = {
   435000000L,   // 435.0 MHz  弱信号区起点
-  435500000L,   // 435.5 MHz  弱信号中心（第一张图）
+  435500000L,   // 435.5 MHz  弱信号中心
   436000000L,   // 436.0 MHz  弱信号右侧亮斑
-  438125000L,   // 438.125 MHz ★ 强 Meshtastic 信号（第三张图）
+  438125000L,   // 438.125 MHz ★ 强 Meshtastic 信号
   433000000L,   // 433.0 MHz  ISM 常用
   434000000L,   // 434.0 MHz  ISM 常用
 };
@@ -135,15 +132,15 @@ inline int curCR() { return COMBO_LIST[comboIdx].cr; }
 //  LoRa 配置下发
 // ============================================================
 void applyLoRaConfig() {
-  LoRa.idle();
-  LoRa.setSyncWord(MESHTASTIC_SYNC);
-  LoRa.setFrequency(FREQ_LIST[freqIdx]);
-  LoRa.setSignalBandwidth(BW);
-  LoRa.setSpreadingFactor(curSF());
-  LoRa.setCodingRate4(curCR());
-  LoRa.setPreambleLength(8);
-  LoRa.disableCrc();   // 先关 CRC，提高捕获率
-  LoRa.receive();
+  Heltec.LoRa.idle();
+  Heltec.LoRa.setSyncWord(MESHTASTIC_SYNC);
+  Heltec.LoRa.setFrequency(FREQ_LIST[freqIdx]);
+  Heltec.LoRa.setSignalBandwidth(BW);
+  Heltec.LoRa.setSpreadingFactor(curSF());
+  Heltec.LoRa.setCodingRate4(curCR());
+  Heltec.LoRa.setPreambleLength(8);
+  Heltec.LoRa.disableCrc();   // 先关 CRC，提高捕获率
+  Heltec.LoRa.receive();
 
   Serial.printf("[CFG] %.3f MHz | SF%d | CR4/%d | BW:%ldkHz | SYNC:0x%02X\n",
     FREQ_LIST[freqIdx] / 1e6, curSF(), curCR(), BW / 1000, MESHTASTIC_SYNC);
@@ -159,8 +156,8 @@ void onReceive(int packetSize) {
   lastPayload = "";
   char hexBuf[4];
   int byteCount = 0;
-  while (LoRa.available()) {
-    uint8_t b = (uint8_t)LoRa.read();
+  while (Heltec.LoRa.available()) {
+    uint8_t b = (uint8_t)Heltec.LoRa.read();
     // 先尝试可打印字符，否则 HEX
     if (b >= 0x20 && b < 0x7F) {
       lastPayload += (char)b;
@@ -171,8 +168,8 @@ void onReceive(int packetSize) {
     if (++byteCount >= 64) { lastPayload += "..."; break; }  // 截断保护
   }
 
-  lastRSSI  = LoRa.packetRssi();
-  lastSNR   = (int)LoRa.packetSnr();
+  lastRSSI  = Heltec.LoRa.packetRssi();
+  lastSNR   = (int)Heltec.LoRa.packetSnr();
   newPacket = true;
   locked    = true;   // 自动锁定
 
@@ -185,7 +182,7 @@ void onReceive(int packetSize) {
 //  RSSI 采样 → 瀑布图缓冲
 // ============================================================
 void sampleRSSI() {
-  rssiHistory[rssiWrIdx] = LoRa.packetRssi();
+  rssiHistory[rssiWrIdx] = Heltec.LoRa.packetRssi();
   rssiWrIdx = (rssiWrIdx + 1) % WF_W;
 }
 
@@ -283,10 +280,10 @@ void autoScan() {
 //  setup
 // ============================================================
 void setup() {
-  Serial.begin(115200);
+  // Heltec.begin 会自动初始化 Serial, OLED(Heltec.display) 和 LoRa(Heltec.LoRa)
+  Heltec.begin(/*DisplayEnable*/ true, /*HeltecOFF*/ true, /*SerialEnable*/ true,
+               /*PABOOST*/ true, FREQ_LIST[freqIdx]);
 
-  Heltec.begin(/*display*/true, /*LoRa*/true, /*Serial*/true,
-               /*PABOOST*/true, FREQ_LIST[freqIdx]);
   Heltec.display->flipScreenVertically();
 
   // 启动画面
@@ -303,7 +300,7 @@ void setup() {
   // 清零 RSSI 历史
   for (int i = 0; i < WF_W; i++) rssiHistory[i] = RSSI_MIN;
 
-  LoRa.onReceive(onReceive);
+  Heltec.LoRa.onReceive(onReceive);
   applyLoRaConfig();
 
   lastSwitchMs = millis();
@@ -321,7 +318,7 @@ void setup() {
 //  loop
 // ============================================================
 void loop() {
-  LoRa.parsePacket();   // 非阻塞接收
+  Heltec.LoRa.parsePacket();   // 非阻塞接收
 
   handleButton();
   autoScan();
@@ -340,6 +337,5 @@ void loop() {
 
   if (newPacket) {
     newPacket = false;
-    // 已在 onReceive() 中打印，此处可扩展（写 SD、发 MQTT 等）
   }
 }
