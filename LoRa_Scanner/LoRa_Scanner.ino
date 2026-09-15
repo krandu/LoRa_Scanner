@@ -1,4 +1,5 @@
 #include <SPI.h>
+#include <Wire.h>
 #include <LoRa.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -6,10 +7,15 @@
 // ================= 引脚与硬件配置 =================
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 64
-#define OLED_RESET    -1
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// LoRa 引脚
+// Heltec V2 板载 OLED 专用引脚定义
+#define OLED_SDA   4
+#define OLED_SCL   15
+#define OLED_RST   16 
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
+
+// LoRa 引脚 (Heltec WiFi LoRa 32 V2)
 #define SCK_PIN   5
 #define MISO_PIN  19
 #define MOSI_PIN  27
@@ -20,9 +26,9 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 #define PRG_BUTTON_PIN 0  // PRG 按键 GPIO 0
 
 // ================= 频率配置与切换列表 =================
-const float FREQ_LIST[] = { 438.150, 438.125, 438.000, 438.500 }; // 常用频率切换列表 (MHz)
+const float FREQ_LIST[] = { 438.150, 438.125, 438.000, 438.500 }; 
 const int FREQ_COUNT = sizeof(FREQ_LIST) / sizeof(FREQ_LIST[0]);
-int freqIdx = 0; // 当前选中的频率索引
+int freqIdx = 0;
 float currentFreq = FREQ_LIST[0];
 
 long signalBandwidth = 125E3; // 125kHz
@@ -32,25 +38,20 @@ struct LoRaCombo {
   uint8_t cr;
 };
 
-// 扫描参数列表 (包含 SF12 CR5)
+// 参数列表，默认首选 SF12 CR5 (CR4/5)
 const LoRaCombo COMBO_LIST[] = {
+  {12, 5}, // 默认固定 SF12 / CR5
   {7,  5},
   {8,  5},
   {9,  5},
   {10, 5},
   {11, 5},
-  {12, 5}, // SF12 / CR5
   {7,  8},
   {12, 8}
 };
 const int COMBO_COUNT = sizeof(COMBO_LIST) / sizeof(COMBO_LIST[0]);
 
-int comboIdx = 0;
-bool locked = false;
-
-// 自动扫描控制
-unsigned long lastScanMs = 0;
-const unsigned long SCAN_INTERVAL_MS = 800;
+int comboIdx = 0; // 默认指向 SF12 / CR5
 
 // 频谱历史缓冲区 (112 像素宽)
 #define BOX_X 8
@@ -63,7 +64,7 @@ float rssiHistory[RSSI_HIST_LEN];
 int rssiWrIdx = 0;
 unsigned long lastSampleMs = 0;
 
-// ================= 按键状态机 (双击/长按) =================
+// ================= 按键状态机 =================
 enum BtnEvent { NONE, SINGLE_CLICK, DOUBLE_CLICK, LONG_PRESS };
 unsigned long btnPressTime = 0;
 unsigned long lastReleaseTime = 0;
@@ -72,7 +73,7 @@ bool isWaitingForClick = false;
 
 // ================= 菜单系统 =================
 bool inMenu = false;
-int menuSelection = 0; // 0: Reboot, 1: Deep Sleep
+int menuSelection = 0; 
 const int MENU_ITEMS = 2;
 
 // ================= 函数声明 =================
@@ -87,7 +88,16 @@ void setup() {
   Serial.begin(115200);
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
-  // 初始化 OLED
+  // 1. 复位 Heltec OLED 屏幕硬件
+  pinMode(OLED_RST, OUTPUT);
+  digitalWrite(OLED_RST, LOW);
+  delay(20);
+  digitalWrite(OLED_RST, HIGH);
+
+  // 2. 初始化指定 SDA/SCL 的 I2C 总线
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  // 3. 初始化 OLED
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println(F("SSD1306 allocation failed"));
     for(;;);
@@ -99,7 +109,7 @@ void setup() {
   display.println(F("Initializing..."));
   display.display();
 
-  // 初始化 SPI & LoRa
+  // 4. 初始化 SPI & LoRa
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
 
@@ -115,6 +125,7 @@ void setup() {
   // 初始化 RSSI 数组
   for (int i = 0; i < RSSI_HIST_LEN; i++) rssiHistory[i] = -120.0;
 
+  // 应用初始参数 (默认 SF12 CR5)
   applyLoRaConfig();
 }
 
@@ -127,30 +138,26 @@ void loop() {
   }
 
   if (inMenu) {
-    // ---- 菜单模式控制 ----
+    // ---- 菜单模式 ----
     if (evt == SINGLE_CLICK) {
-      menuSelection = (menuSelection + 1) % MENU_ITEMS; // 切换菜单选项
+      menuSelection = (menuSelection + 1) % MENU_ITEMS;
     } else if (evt == LONG_PRESS) {
       if (menuSelection == 0) {
-        ESP.restart(); // 重启
+        ESP.restart();
       } else if (menuSelection == 1) {
-        enterDeepSleep(); // 关机休眠
+        enterDeepSleep();
       }
     }
     drawMenuDisplay();
   } else {
-    // ---- 正常工作模式 ----
+    // ---- 工作模式 ----
     if (evt == SINGLE_CLICK) {
-      // 单击：手动切换下一个频率点
+      // 单击：切换频率
       freqIdx = (freqIdx + 1) % FREQ_COUNT;
       currentFreq = FREQ_LIST[freqIdx];
-      locked = false; // 切换频率后解除锁定，重新开启扫描
       applyLoRaConfig();
-    }
-
-    // 自动扫描 SF / CR 参数
-    if (!locked && (millis() - lastScanMs >= SCAN_INTERVAL_MS)) {
-      lastScanMs = millis();
+    } else if (evt == LONG_PRESS) {
+      // 长按：手动切换 SF/CR 参数
       comboIdx = (comboIdx + 1) % COMBO_COUNT;
       applyLoRaConfig();
     }
@@ -164,7 +171,6 @@ void loop() {
     // LoRa 数据包接收检测
     int packetSize = LoRa.parsePacket();
     if (packetSize) {
-      locked = true; // 抓到数据包，锁定当前 SF/CR
       Serial.printf("Packet received on %.3f MHz SF%d CR4/%d, RSSI: %d\n", 
                     currentFreq, COMBO_LIST[comboIdx].sf, COMBO_LIST[comboIdx].cr, LoRa.packetRssi());
     }
@@ -173,7 +179,6 @@ void loop() {
   }
 }
 
-// 应用当前的 LoRa 参数 (包括频率、带宽、SF、CR)
 void applyLoRaConfig() {
   LoRa.setFrequency(currentFreq * 1E6);
   LoRa.setSignalBandwidth(signalBandwidth);
@@ -185,53 +190,43 @@ void applyLoRaConfig() {
                 currentFreq, COMBO_LIST[comboIdx].sf, COMBO_LIST[comboIdx].cr);
 }
 
-// 采样 RSSI
 void sampleRSSI() {
   float rawRssi = LoRa.packetRssi(); 
-  if (rawRssi == 0) rawRssi = -120; // 防止未触发时的空值
+  if (rawRssi == 0) rawRssi = -120;
   rssiHistory[rssiWrIdx] = rawRssi;
   rssiWrIdx = (rssiWrIdx + 1) % RSSI_HIST_LEN;
 }
 
-// 绘制主界面
 void drawMainDisplay() {
   display.clearDisplay();
 
-  // 1. 顶部状态栏: 频率与锁定状态
+  // 1. 顶部状态栏
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.printf("%.3fMHz", currentFreq);
   
   display.setCursor(85, 0);
-  if (locked) {
-    display.print("[LOCK]");
-  } else {
-    display.print("[SCAN]");
-  }
+  display.print("[FIXED]"); // 固定模式标识
 
-  // 2. 绘制频谱框外壳
+  // 2. 频谱框外壳
   display.drawRect(BOX_X - 1, BOX_Y - 1, BOX_W + 2, BOX_H + 2, SSD1306_WHITE);
 
-  // 3. 绘制 RSSI 波形 (由右向左移动)
+  // 3. RSSI 波形
   for (int col = 0; col < BOX_W; col++) {
     int idx = (rssiWrIdx + col) % RSSI_HIST_LEN;
     float val = rssiHistory[idx];
     
-    // 将 RSSI (-120dBm 到 -30dBm) 映射到 0 ~ BOX_H 像素
     int lineH = map((int)constrain(val, -120, -30), -120, -30, 0, BOX_H);
     if (lineH > 0) {
       display.drawFastVLine(BOX_X + col, BOX_Y + BOX_H - lineH, lineH, SSD1306_WHITE);
     }
   }
 
-  // 4. 底部显示 (左下角：带宽，右下角：SF/CR)
+  // 4. 底部状态
   int bottomY = 52;
-
-  // 左下角：带宽显示
   display.setCursor(0, bottomY);
   display.printf("BW:%.0fK", signalBandwidth / 1000.0);
 
-  // 右下角：SF/CR 参数显示
   char sfCrBuf[16];
   snprintf(sfCrBuf, sizeof(sfCrBuf), "SF%d/CR4/%d", COMBO_LIST[comboIdx].sf, COMBO_LIST[comboIdx].cr);
   int xPos = SCREEN_WIDTH - (strlen(sfCrBuf) * 6);
@@ -241,7 +236,6 @@ void drawMainDisplay() {
   display.display();
 }
 
-// 绘制系统菜单
 void drawMenuDisplay() {
   display.clearDisplay();
   
@@ -250,7 +244,6 @@ void drawMenuDisplay() {
   display.println("= SYSTEM MENU =");
   display.drawFastHLine(0, 16, 128, SSD1306_WHITE);
 
-  // 菜单项 1: Reboot
   if (menuSelection == 0) {
     display.fillRect(10, 24, 108, 14, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
@@ -260,7 +253,6 @@ void drawMenuDisplay() {
   display.setCursor(15, 27);
   display.println("1. Reboot System");
 
-  // 菜单项 2: Deep Sleep
   if (menuSelection == 1) {
     display.fillRect(10, 42, 108, 14, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
@@ -270,12 +262,10 @@ void drawMenuDisplay() {
   display.setCursor(15, 45);
   display.println("2. Deep Sleep (OFF)");
 
-  // 还原前景色
   display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
   display.display();
 }
 
-// 进入低功耗关机休眠
 void enterDeepSleep() {
   display.clearDisplay();
   display.setCursor(30, 28);
@@ -285,12 +275,10 @@ void enterDeepSleep() {
   display.clearDisplay();
   display.display();
 
-  // 配置 GPIO 0 低电平唤醒（按 PRG 键重新开机）
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PRG_BUTTON_PIN, 0);
   esp_deep_sleep_start();
 }
 
-// 按键检测状态机 (处理单击、双击、长按)
 BtnEvent checkButton() {
   bool currentState = digitalRead(PRG_BUTTON_PIN);
   unsigned long now = millis();
@@ -301,7 +289,7 @@ BtnEvent checkButton() {
   } else if (lastBtnState == LOW && currentState == HIGH) {
     unsigned long pressDuration = now - btnPressTime;
     
-    if (pressDuration >= 1500) {
+    if (pressDuration >= 1200) {
       event = LONG_PRESS;
       isWaitingForClick = false;
     } else if (pressDuration > 50) {
