@@ -8,10 +8,11 @@
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 64
 
-// Heltec V2 板载 OLED 专用引脚定义
-#define OLED_SDA   4
-#define OLED_SCL   15
-#define OLED_RST   16 
+// Heltec V2 板载 OLED 与电源引脚定义
+#define VEXT_CTRL_PIN 21 // 外部供电控制引脚 (拉低开启 OLED 供电)
+#define OLED_SDA      4
+#define OLED_SCL      15
+#define OLED_RST      16 
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 
@@ -38,9 +39,9 @@ struct LoRaCombo {
   uint8_t cr;
 };
 
-// 参数列表，默认首选 SF12 CR5 (CR4/5)
+// 参数列表，默认固定第 0 项为 SF12 CR5 (CR4/5)
 const LoRaCombo COMBO_LIST[] = {
-  {12, 5}, // 默认固定 SF12 / CR5
+  {12, 5}, // 默认首选 SF12 / CR5
   {7,  5},
   {8,  5},
   {9,  5},
@@ -51,7 +52,7 @@ const LoRaCombo COMBO_LIST[] = {
 };
 const int COMBO_COUNT = sizeof(COMBO_LIST) / sizeof(COMBO_LIST[0]);
 
-int comboIdx = 0; // 默认指向 SF12 / CR5
+int comboIdx = 0; // 默认指向 SF12 / CR5，绝对不自动变动
 
 // 频谱历史缓冲区 (112 像素宽)
 #define BOX_X 8
@@ -88,16 +89,21 @@ void setup() {
   Serial.begin(115200);
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
-  // 1. 复位 Heltec OLED 屏幕硬件
+  // 1. 开启 Heltec 板载外设 (OLED) 供电电源 VEXT (GPIO 21 拉低)
+  pinMode(VEXT_CTRL_PIN, OUTPUT);
+  digitalWrite(VEXT_CTRL_PIN, LOW); 
+  delay(50); // 等待供电稳定
+
+  // 2. 复位 OLED 硬件
   pinMode(OLED_RST, OUTPUT);
   digitalWrite(OLED_RST, LOW);
   delay(20);
   digitalWrite(OLED_RST, HIGH);
 
-  // 2. 初始化指定 SDA/SCL 的 I2C 总线
+  // 3. 初始化指定 SDA/SCL 引脚的 I2C 总线
   Wire.begin(OLED_SDA, OLED_SCL);
 
-  // 3. 初始化 OLED
+  // 4. 初始化 OLED
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println(F("SSD1306 allocation failed"));
     for(;;);
@@ -109,7 +115,7 @@ void setup() {
   display.println(F("Initializing..."));
   display.display();
 
-  // 4. 初始化 SPI & LoRa
+  // 5. 初始化 SPI & LoRa
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
 
@@ -122,17 +128,17 @@ void setup() {
     while (1);
   }
 
-  // 初始化 RSSI 数组
+  // 初始化 RSSI 历史缓存
   for (int i = 0; i < RSSI_HIST_LEN; i++) rssiHistory[i] = -120.0;
 
-  // 应用初始参数 (默认 SF12 CR5)
+  // 应用初始配置（频率 438.150 MHz，SF12 / CR5）
   applyLoRaConfig();
 }
 
 void loop() {
   BtnEvent evt = checkButton();
 
-  // 双击进入/退出系统菜单
+  // 双击切换 系统菜单 / 主界面
   if (evt == DOUBLE_CLICK) {
     inMenu = !inMenu;
   }
@@ -150,25 +156,25 @@ void loop() {
     }
     drawMenuDisplay();
   } else {
-    // ---- 工作模式 ----
+    // ---- 主界面运行模式 ----
     if (evt == SINGLE_CLICK) {
-      // 单击：切换频率
+      // 单击：手动循环切换频率
       freqIdx = (freqIdx + 1) % FREQ_COUNT;
       currentFreq = FREQ_LIST[freqIdx];
       applyLoRaConfig();
     } else if (evt == LONG_PRESS) {
-      // 长按：手动切换 SF/CR 参数
+      // 长按：手动循环切换 SF/CR 参数
       comboIdx = (comboIdx + 1) % COMBO_COUNT;
       applyLoRaConfig();
     }
 
-    // 定时采样 RSSI 刷新频谱
+    // 定时采样 RSSI 刷新频谱（30ms 采样一次）
     if (millis() - lastSampleMs >= 30) {
       lastSampleMs = millis();
       sampleRSSI();
     }
 
-    // LoRa 数据包接收检测
+    // 检测是否有 LoRa 接收包
     int packetSize = LoRa.parsePacket();
     if (packetSize) {
       Serial.printf("Packet received on %.3f MHz SF%d CR4/%d, RSSI: %d\n", 
@@ -179,6 +185,7 @@ void loop() {
   }
 }
 
+// 应用当前配置并刷新串口日志
 void applyLoRaConfig() {
   LoRa.setFrequency(currentFreq * 1E6);
   LoRa.setSignalBandwidth(signalBandwidth);
@@ -186,10 +193,11 @@ void applyLoRaConfig() {
   LoRa.setCodingRate4(COMBO_LIST[comboIdx].cr);
   LoRa.receive();
   
-  Serial.printf("Freq: %.3f MHz | SF: %d | CR: 4/%d\n", 
+  Serial.printf("[LoRa Config] Freq: %.3f MHz | SF: %d | CR: 4/%d\n", 
                 currentFreq, COMBO_LIST[comboIdx].sf, COMBO_LIST[comboIdx].cr);
 }
 
+// 采样 RSSI
 void sampleRSSI() {
   float rawRssi = LoRa.packetRssi(); 
   if (rawRssi == 0) rawRssi = -120;
@@ -197,21 +205,22 @@ void sampleRSSI() {
   rssiWrIdx = (rssiWrIdx + 1) % RSSI_HIST_LEN;
 }
 
+// 绘制主界面
 void drawMainDisplay() {
   display.clearDisplay();
 
-  // 1. 顶部状态栏
+  // 1. 顶部状态栏: 显示频率及固定状态标志
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.printf("%.3fMHz", currentFreq);
   
   display.setCursor(85, 0);
-  display.print("[FIXED]"); // 固定模式标识
+  display.print("[FIXED]");
 
   // 2. 频谱框外壳
   display.drawRect(BOX_X - 1, BOX_Y - 1, BOX_W + 2, BOX_H + 2, SSD1306_WHITE);
 
-  // 3. RSSI 波形
+  // 3. RSSI 波形 (由右向左平移)
   for (int col = 0; col < BOX_W; col++) {
     int idx = (rssiWrIdx + col) % RSSI_HIST_LEN;
     float val = rssiHistory[idx];
@@ -222,7 +231,7 @@ void drawMainDisplay() {
     }
   }
 
-  // 4. 底部状态
+  // 4. 底部显示: 带宽 & 模式
   int bottomY = 52;
   display.setCursor(0, bottomY);
   display.printf("BW:%.0fK", signalBandwidth / 1000.0);
@@ -236,6 +245,7 @@ void drawMainDisplay() {
   display.display();
 }
 
+// 绘制系统菜单
 void drawMenuDisplay() {
   display.clearDisplay();
   
@@ -266,6 +276,7 @@ void drawMenuDisplay() {
   display.display();
 }
 
+// 关机 / 休眠
 void enterDeepSleep() {
   display.clearDisplay();
   display.setCursor(30, 28);
@@ -275,10 +286,14 @@ void enterDeepSleep() {
   display.clearDisplay();
   display.display();
 
+  // 关机时断开外部电路电源
+  digitalWrite(VEXT_CTRL_PIN, HIGH);
+
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PRG_BUTTON_PIN, 0);
   esp_deep_sleep_start();
 }
 
+// 按键检测
 BtnEvent checkButton() {
   bool currentState = digitalRead(PRG_BUTTON_PIN);
   unsigned long now = millis();
