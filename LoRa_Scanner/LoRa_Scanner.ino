@@ -33,18 +33,25 @@ SystemMode currentMode = MODE_SPECTRUM; // 默认启动为频谱分析模式
 #define SPEC_START_FREQ  430.0
 #define SPEC_END_FREQ    440.0
 #define SPEC_CHANNELS    40     // 40 个通道 (步长 250kHz)
-#define SPEC_BOX_X       4
-#define SPEC_BOX_Y       12
-#define SPEC_BOX_W       120
-#define SPEC_BOX_H       20
-#define WATERFALL_Y      34
-#define WATERFALL_H      16
+
+// 频谱图区域布局（加边框后内部显示宽度为 120px）
+#define SPEC_BOX_X       3
+#define SPEC_BOX_Y       11
+#define SPEC_BOX_W       122
+#define SPEC_BOX_H       18
+
+// 瀑布图区域布局（加边框）
+#define WATERFALL_X      3
+#define WATERFALL_Y      32
+#define WATERFALL_W      122
+#define WATERFALL_H      20
 
 float specRssi[SPEC_CHANNELS];
-uint8_t waterfallBuf[WATERFALL_H][SPEC_CHANNELS]; // 瀑布图历史数据缓存
+uint8_t waterfallBuf[WATERFALL_H - 2][SPEC_CHANNELS]; // 内部显示历史数据缓存
 
 float peakRssiFreq = 430.0;
 float maxFoundRssi = -120.0;
+float minFoundRssi = -120.0; // 全频段最低底噪基准
 
 // ================= LoRa 模式配置与缓冲区 =================
 const float FREQ_LIST[] = { 438.150, 438.125, 438.000, 438.500 }; 
@@ -215,10 +222,11 @@ void loop() {
   }
 }
 
-// 快速全频段 RSSI 扫描
+// 快速全频段 RSSI 扫描（计算最小底噪基准）
 void runSpectrumScan() {
   float step = (SPEC_END_FREQ - SPEC_START_FREQ) / SPEC_CHANNELS;
-  maxFoundRssi = -120.0;
+  maxFoundRssi = -160.0;
+  minFoundRssi = 0.0;
 
   for (int i = 0; i < SPEC_CHANNELS; i++) {
     float freq = SPEC_START_FREQ + i * step;
@@ -233,24 +241,33 @@ void runSpectrumScan() {
       maxFoundRssi = val;
       peakRssiFreq = freq;
     }
+    if (val < minFoundRssi) {
+      minFoundRssi = val;
+    }
   }
 
-  // 瀑布图向下平移更新
-  for (int y = WATERFALL_H - 1; y > 0; y--) {
+  // 保护边界：防止极端情况下的底噪过于接近顶格
+  if (minFoundRssi > -60.0) minFoundRssi = -120.0;
+
+  // 瀑布图向下平移更新（在框内部区域流动）
+  int wfLines = WATERFALL_H - 2;
+  for (int y = wfLines - 1; y > 0; y--) {
     for (int x = 0; x < SPEC_CHANNELS; x++) {
       waterfallBuf[y][x] = waterfallBuf[y - 1][x];
     }
   }
 
-  // 编码顶行瀑布图数值 (0: 弱, 1: 中, 2: 强)
+  // 基于最低底噪 minFoundRssi 动态计算瀑布图强度划分：
+  // 0: 底噪/极弱信号  1: 中等信号 (高于底噪 12dB)  2: 强信号 (高于底噪 30dB)
   for (int x = 0; x < SPEC_CHANNELS; x++) {
-    if (specRssi[x] > -75)       waterfallBuf[0][x] = 2;
-    else if (specRssi[x] > -95)  waterfallBuf[0][x] = 1;
-    else                         waterfallBuf[0][x] = 0;
+    float delta = specRssi[x] - minFoundRssi;
+    if (delta > 30.0)      waterfallBuf[0][x] = 2;
+    else if (delta > 12.0) waterfallBuf[0][x] = 1;
+    else                   waterfallBuf[0][x] = 0;
   }
 }
 
-// 绘制频谱图 + 瀑布图界面
+// 绘制带有专属边框的频谱图与瀑布图
 void drawSpectrumDisplay() {
   display.clearDisplay();
 
@@ -265,38 +282,55 @@ void drawSpectrumDisplay() {
   display.setCursor(peakX, 0);
   display.print(peakBuf);
 
-  // 2. 频谱柱状图 (SPEC_BOX_X 到 SPEC_BOX_X + 120)
-  int colWidth = SPEC_BOX_W / SPEC_CHANNELS; // 3px 每通道
+  // 2. 绘制频谱图边框
+  display.drawRect(SPEC_BOX_X, SPEC_BOX_Y, SPEC_BOX_W, SPEC_BOX_H, SSD1306_WHITE);
+
+  // 频谱柱状图内容（绘制在框内）
+  int innerX = SPEC_BOX_X + 1;
+  int innerY = SPEC_BOX_Y + 1;
+  int innerH = SPEC_BOX_H - 2;
+  int colWidth = (SPEC_BOX_W - 2) / SPEC_CHANNELS; // 每通道 3px 宽
+
   for (int i = 0; i < SPEC_CHANNELS; i++) {
-    int lineH = map((int)constrain(specRssi[i], -115, -30), -115, -30, 0, SPEC_BOX_H);
-    int xPos = SPEC_BOX_X + i * colWidth;
+    // 以当前扫描到的最低底噪 minFoundRssi 为 X 轴基准起点
+    int lineH = map((int)constrain(specRssi[i], minFoundRssi, -30.0), (int)minFoundRssi, -30, 0, innerH);
+    int xPos = innerX + i * colWidth;
     if (lineH > 0) {
-      display.fillRect(xPos, SPEC_BOX_Y + SPEC_BOX_H - lineH, colWidth - 1, lineH, SSD1306_WHITE);
+      display.fillRect(xPos, innerY + innerH - lineH, colWidth - 1, lineH, SSD1306_WHITE);
     }
   }
-  display.drawFastHLine(SPEC_BOX_X - 2, SPEC_BOX_Y + SPEC_BOX_H, SPEC_BOX_W + 4, SSD1306_WHITE);
 
-  // 3. 瀑布图绘制
-  for (int y = 0; y < WATERFALL_H; y++) {
+  // 3. 绘制瀑布图边框
+  display.drawRect(WATERFALL_X, WATERFALL_Y, WATERFALL_W, WATERFALL_H, SSD1306_WHITE);
+
+  // 瀑布图内容（绘制在框内）
+  int wfInnerX = WATERFALL_X + 1;
+  int wfInnerY = WATERFALL_Y + 1;
+  int wfLines = WATERFALL_H - 2;
+
+  for (int y = 0; y < wfLines; y++) {
     for (int i = 0; i < SPEC_CHANNELS; i++) {
-      int xPos = SPEC_BOX_X + i * colWidth;
+      int xPos = wfInnerX + i * colWidth;
       uint8_t val = waterfallBuf[y][i];
 
       if (val == 2) {
-        // 强信号：完全点亮像素块
-        display.fillRect(xPos, WATERFALL_Y + y, colWidth - 1, 1, SSD1306_WHITE);
+        // 强信号：点亮块
+        display.fillRect(xPos, wfInnerY + y, colWidth - 1, 1, SSD1306_WHITE);
       } else if (val == 1) {
-        // 中等信号：抖动点阵 (间隔点亮)
+        // 中等信号：抖动点阵
         if ((i + y) % 2 == 0) {
-          display.drawPixel(xPos, WATERFALL_Y + y, SSD1306_WHITE);
+          display.drawPixel(xPos, wfInnerY + y, SSD1306_WHITE);
         }
       }
     }
   }
 
-  // 4. 底部扫描信息栏
+  // 4. 底部扫描信息栏：STEP 在右下角左对齐布局
   display.setCursor(0, 56);
-  display.printf("SPAN:10M STEP:250K");
+  display.print("SPAN:10M");
+
+  display.setCursor(72, 56); // 右下角起始 XPos 对齐，呈现左对齐效果
+  display.print("STEP:250K");
 
   display.display();
 }
