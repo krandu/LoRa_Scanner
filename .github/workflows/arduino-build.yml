@@ -57,12 +57,7 @@ jobs:
           arduino-cli lib install "Heltec ESP32 Dev-Boards"
           arduino-cli lib install "LoRa"
 
-      # ── 8. 自动探测 FQBN 并编译 ─────────────────────────────
-      #
-      #   --export-binaries  让 arduino-cli 把 bootloader.bin /
-      #   partitions.bin / boot_app0.bin 一并输出到 build/ 目录，
-      #   这样后续合并时用的是和本次编译完全匹配的文件。
-      #
+      # ── 8. 自动探测 FQBN 并指定 spiffs/partitions.csv 编译 ────
       - name: Compile sketch
         run: |
           FQBN=$(arduino-cli board listall | grep -i "WiFiLoRa32.*V2" | awk '{print $NF}' | head -1)
@@ -79,11 +74,14 @@ jobs:
           echo "FQBN=$FQBN" >> $GITHUB_ENV
           echo "Using FQBN: $FQBN"
 
+          PART_PATH="$(pwd)/spiffs/partitions.csv"
+
           arduino-cli compile \
             --fqbn "$FQBN" \
             --warnings default \
             --export-binaries \
-            --build-property "build.partitions=partitions" \
+            --build-property "build.partitions=custom" \
+            --build-property "build.custom_partitions=$PART_PATH" \
             --build-property "upload.maximum_size=3342336" \
             --output-dir build/ \
             LoRa_Scanner/LoRa_Scanner.ino
@@ -93,18 +91,16 @@ jobs:
         run: ls -lh build/
 
       # ── 10. 生成 SPIFFS 镜像 ─────────────────────────────────
-      #
-      #   spiffs/ 目录放需要打包进文件系统的资源文件（可为空）。
-      #   大小 0x180000 = 1572864 字节，与 partitions.csv 对应。
-      #   page=256 block=4096 是 ESP32 Flash 标准参数。
-      #
+      #   创建临时镜像构建目录 spiffs_data，避免把 partitions.csv 也打包进去
       - name: Generate SPIFFS image
         run: |
-          mkdir -p spiffs
-          # 如果 spiffs/ 目录里有文件会一起打包，空目录也可正常生成
-          spiffsgen.py \
+          mkdir -p spiffs_data
+          if [ -d "spiffs" ]; then
+            rsync -av --exclude='partitions.csv' spiffs/ spiffs_data/ || true
+          fi
+          python3 /usr/local/bin/spiffsgen.py \
             1572864 \
-            spiffs/ \
+            spiffs_data/ \
             build/spiffs.bin \
             --page-size 256 \
             --block-size 4096
@@ -112,17 +108,8 @@ jobs:
           ls -lh build/spiffs.bin
 
       # ── 11. 合并成单一可烧录固件 ─────────────────────────────
-      #
-      #   地址布局（8MB Flash）：
-      #     0x1000  bootloader
-      #     0x8000  分区表
-      #     0xe000  boot_app0
-      #     0x10000 应用程序
-      #     0x670000 SPIFFS
-      #
       - name: Merge firmware (merged-firmware.bin)
         run: |
-          # 定位编译产物（arduino-cli 输出路径含 fqbn 子目录）
           BOOT=$(find build/ -name "bootloader.bin"  | head -1)
           PART=$(find build/ -name "partitions.bin"  | head -1)
           BAPP=$(find build/ -name "boot_app0.bin"   | head -1)
