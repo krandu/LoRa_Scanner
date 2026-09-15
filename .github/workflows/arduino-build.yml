@@ -34,54 +34,42 @@ jobs:
           curl -sSL https://raw.githubusercontent.com/espressif/esp-idf/master/components/spiffs/spiffsgen.py -o /usr/local/bin/spiffsgen.py
           chmod +x /usr/local/bin/spiffsgen.py
 
-      # ── 4. 配置 Board Manager URL ────────────────────────────
+      # ── 4. 配置 ESP32 官方 Board Manager URL ──────────────────
       - name: Configure arduino-cli
         run: |
           arduino-cli config init
           arduino-cli config add board_manager.additional_urls \
-            https://resource.heltec.cn/download/package_heltec_esp32_index.json
+            https://espressif.github.io/arduino-esp32/package_esp32_index.json
 
-      # ── 5. 更新索引 & 安装兼容核心 ───────────────────────────
+      # ── 5. 更新索引 & 安装 ESP32 官方 Core ───────────────────
       - name: Update index and install core
         run: |
           arduino-cli core update-index
-          # 锁定 Heltec-esp32 核心包版本为 0.0.8，避免 3.x 版本的底层 SPI API 变动
-          arduino-cli core install Heltec-esp32:esp32@0.0.8
+          arduino-cli core install esp32:esp32
 
-      # ── 6. 列出已安装板子（确认 FQBN）───────────────────────
-      - name: List installed boards
-        run: arduino-cli board listall | grep -i heltec || true
-
-      # ── 7. 安装依赖库 ────────────────────────────────────────
+      # ── 6. 安装 Heltec 兼容依赖库 ────────────────────────────
       - name: Install libraries
         run: |
           arduino-cli lib install "Heltec ESP32 Dev-Boards"
+          arduino-cli lib install "Adafruit GFX Library"
+          arduino-cli lib install "Adafruit BusIO"
 
-      # ── 8. 覆盖默认分区表并编译（屏蔽 Warning 终止）───────────
+      # ── 7. 覆盖默认分区表并编译（使用标准 esp32 FQBN）─────────
       - name: Compile sketch
         run: |
-          FQBN=$(arduino-cli board listall | grep -i "WiFiLoRa32.*V2" | awk '{print $NF}' | head -1)
-          if [ -z "$FQBN" ]; then
-            for C in \
-              "Heltec-esp32:esp32:WIFI_LoRa_32_V2" \
-              "Heltec-esp32:esp32:heltec_wifi_lora_32_V2" \
-              "Heltec-esp32:esp32:WiFiLoRa32V2" \
-              "esp32:esp32:heltec_wifi_lora_32_V2"
-            do
-              arduino-cli board listall | grep -q "$C" && FQBN="$C" && break
-            done
-          fi
+          # 使用官方 esp32 包中的 heltec_wifi_lora_32_V2 FQBN
+          FQBN="esp32:esp32:heltec_wifi_lora_32_V2"
           echo "FQBN=$FQBN" >> $GITHUB_ENV
           echo "Using FQBN: $FQBN"
 
           # 覆盖开发板默认的分区表
-          PART_DIR=$(find /home/runner/.arduino15/packages/Heltec-esp32/ -type d -name "partitions" | head -1)
+          PART_DIR=$(find /home/runner/.arduino15/packages/esp32/hardware/esp32/ -type d -name "partitions" | head -1)
           if [ -d "$PART_DIR" ]; then
             echo "Copying custom partitions.csv to $PART_DIR/default.csv"
             cp spiffs/partitions.csv "$PART_DIR/default.csv"
           fi
 
-          # --warnings none 忽略第三方库的 C++ 溢出警告
+          # --warnings none 忽略第三方 C++ 溢出警告
           arduino-cli compile \
             --fqbn "$FQBN" \
             --warnings none \
@@ -90,11 +78,11 @@ jobs:
             --output-dir build/ \
             LoRa_Scanner/LoRa_Scanner.ino
 
-      # ── 9. 列出 build 目录内容（调试用）─────────────────────
+      # ── 8. 列出 build 目录内容（调试用）─────────────────────
       - name: List build outputs
         run: ls -lh build/
 
-      # ── 10. 生成 SPIFFS 镜像 ─────────────────────────────────
+      # ── 9. 生成 SPIFFS 镜像 ──────────────────────────────────
       - name: Generate SPIFFS image
         run: |
           mkdir -p spiffs_data
@@ -110,7 +98,7 @@ jobs:
           echo "SPIFFS image:"
           ls -lh build/spiffs.bin
 
-      # ── 11. 合并成单一可烧录固件 ─────────────────────────────
+      # ── 10. 合并成单一可烧录固件 ─────────────────────────────
       - name: Merge firmware (merged-firmware.bin)
         run: |
           BOOT=$(find build/ -name "bootloader.bin"  | head -1)
@@ -138,7 +126,7 @@ jobs:
           echo "=== merged-firmware.bin ==="
           ls -lh build/merged-firmware.bin
 
-      # ── 12. 上传所有产物 ─────────────────────────────────────
+      # ── 11. 上传所有产物 ─────────────────────────────────────
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -151,7 +139,7 @@ jobs:
             build/*.ino.map
           retention-days: 30
 
-      # ── 13. 打印固件摘要 ─────────────────────────────────────
+      # ── 12. 打印固件摘要 ─────────────────────────────────────
       - name: Firmware summary
         run: |
           echo "==============================="
@@ -166,15 +154,3 @@ jobs:
           echo ""
           echo "Flash 刷写命令（merged-firmware，一键刷入）："
           echo "  esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 921600 write_flash 0x0 merged-firmware.bin"
-          echo ""
-          echo "分步刷写命令："
-          APP=$(find build/ -name "*.ino.bin" ! -name "*bootloader*" ! -name "*partitions*" | head -1)
-          BOOT=$(find build/ -name "bootloader.bin" | head -1)
-          PART=$(find build/ -name "partitions.bin" | head -1)
-          BAPP=$(find build/ -name "boot_app0.bin"  | head -1)
-          echo "  esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 921600 write_flash \\"
-          echo "    0x1000   $BOOT \\"
-          echo "    0x8000   $PART \\"
-          echo "    0xe000   $BAPP \\"
-          echo "    0x10000  $APP  \\"
-          echo "    0x670000 build/spiffs.bin"
