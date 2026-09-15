@@ -237,60 +237,88 @@ void sampleRSSI() {
 void drawMainDisplay() {
   display.clearDisplay();
 
-  // 1. 顶部状态栏：左侧频率，右侧显示 [LOCKED] 或实时 RSSI
+  // 1. 顶部状态栏
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.printf("%.3fMHz", currentFreq);
   
-  display.setCursor(75, 0);
+  // 右上角内容：计算字符长度并像素靠右对齐 (屏幕总宽 128)
+  char rightTopBuf[16];
   if (isLocked) {
-    display.print("[LOCKED]"); 
+    snprintf(rightTopBuf, sizeof(rightTopBuf), "[LOCKED]");
   } else {
     int latestIdx = (rssiWrIdx - 1 + RSSI_HIST_LEN) % RSSI_HIST_LEN;
-    display.printf("%ddBm", (int)rssiHistory[latestIdx]);
+    snprintf(rightTopBuf, sizeof(rightTopBuf), "%ddBm", (int)rssiHistory[latestIdx]);
   }
+  int rightTopX = SCREEN_WIDTH - (strlen(rightTopBuf) * 6);
+  display.setCursor(rightTopX, 0);
+  display.print(rightTopBuf);
 
   // 2. 边框外壳
   display.drawRect(BOX_X - 1, BOX_Y - 1, BOX_W + 2, BOX_H + 2, SSD1306_WHITE);
 
   // 3. 方框区内容
   if (isLocked) {
-    // === 锁定状态：显示解码数据与包信号状态 ===
+    // === 锁定状态：严格控制多行文本边界，避免溢出 ===
     display.setTextSize(1);
-    display.setTextWrap(true);
-    
-    // 超长文本截断并用 ... 结尾
-    String dispText = decodedPayload;
-    if (dispText.length() > 33) {
-      dispText = dispText.substring(0, 30) + "...";
+    display.setTextWrap(false); // 手动控制换行，防止长单词越界
+
+    // 每行最多容纳 17 个字符 (112px / 6px = 18.6)
+    String line1 = "";
+    String line2 = "";
+
+    if (decodedPayload.length() <= 17) {
+      line1 = decodedPayload;
+    } else {
+      line1 = decodedPayload.substring(0, 17);
+      if (decodedPayload.length() > 32) {
+        // 超长文本：截取 15 字符 + ...
+        line2 = decodedPayload.substring(17, 31) + "...";
+      } else {
+        line2 = decodedPayload.substring(17);
+      }
     }
 
     display.setCursor(BOX_X + 2, BOX_Y + 2);
-    if (dispText.length() > 0) {
-      display.print(dispText);
-    } else {
-      display.print("<EMPTY>");
+    display.print(line1.length() > 0 ? line1 : "<EMPTY>");
+
+    if (line2.length() > 0) {
+      display.setCursor(BOX_X + 2, BOX_Y + 11);
+      display.print(line2);
     }
 
-    // 保持原本位置与格式显示 RSSI 和 SNR
+    // 底部固定显示 RSSI 和 SNR
     display.setCursor(BOX_X + 2, BOX_Y + 22);
     display.printf("R:%ddBm S:%.1fdB", lastPacketRssi, lastPacketSnr);
 
   } else {
-    // === 未锁定状态：绘制 RSSI 历史时序波形 ===
+    // === 未锁定状态：绘制 RSSI 动态波形（以当前最低底噪为 X 轴基线）===
     display.setTextWrap(false);
+
+    // 寻找当前历史记录里的最低 RSSI 作为动态底噪起点
+    float minRssi = 0.0;
+    for (int i = 0; i < RSSI_HIST_LEN; i++) {
+      if (rssiHistory[i] < minRssi) {
+        minRssi = rssiHistory[i];
+      }
+    }
+    if (minRssi > -60.0) minRssi = -120.0; // 防止极端情况下的除零或基线失真
+
+    float maxRssi = -30.0; // 固定最高顶格阀值
+
     for (int col = 0; col < BOX_W; col++) {
       int idx = (rssiWrIdx + col) % RSSI_HIST_LEN;
       float val = rssiHistory[idx];
       
-      int lineH = map((int)constrain(val, -120, -30), -120, -30, 0, BOX_H);
+      // 以最低底噪 minRssi 为起点映射柱状图高度
+      int lineH = map((int)constrain(val, minRssi, maxRssi), (int)minRssi, (int)maxRssi, 0, BOX_H - 1);
       if (lineH > 0) {
         display.drawFastVLine(BOX_X + col, BOX_Y + BOX_H - lineH, lineH, SSD1306_WHITE);
       }
     }
   }
 
-  // 4. 底部状态栏：CR 简化显示（如 CR5）
+  // 4. 底部状态栏：CR5 简化显示
   int bottomY = 52;
   display.setTextSize(1);
   display.setCursor(0, bottomY);
