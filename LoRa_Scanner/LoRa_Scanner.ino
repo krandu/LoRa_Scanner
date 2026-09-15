@@ -64,10 +64,9 @@ unsigned long lastSampleMs = 0;
 
 // 信号锁定与解码结果存储
 bool isLocked = false;             // 锁定状态标志
-String decodedPayload = "";        // 解码后的文本数据
+String decodedPayload = "";        // 清洗解码后的文本数据
 int lastPacketRssi = 0;            // 解码数据包的 RSSI
 float lastPacketSnr = 0.0;         // 解码数据包的 SNR
-unsigned long lockTimeMs = 0;      // 锁定时刻戳
 
 // ================= 按键检测状态机 =================
 enum BtnEvent { NONE, SINGLE_CLICK, DOUBLE_CLICK, LONG_PRESS };
@@ -93,7 +92,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
-  // 1. 开启外设电源 VEXT
+  // 1. 开启外设电源 VEXT (GPIO 21 拉低)
   pinMode(VEXT_CTRL_PIN, OUTPUT);
   digitalWrite(VEXT_CTRL_PIN, LOW); 
   delay(50);
@@ -161,7 +160,7 @@ void loop() {
     // 1. 锁定状态下的按键控制
     if (isLocked) {
       if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
-        // 解除锁定机制：按键直接退出锁定，恢复常规扫描/接收
+        // 解除锁定：按键直接退出锁定，恢复常规扫描
         isLocked = false;
         decodedPayload = "";
         Serial.println("[System] Unlocked by user.");
@@ -170,11 +169,11 @@ void loop() {
     // 2. 未锁定状态下的按键控制
     else {
       if (evt == SINGLE_CLICK) {
-        // 短按：切换 SF / CR 参数组合
+        // 短按：循环切换 SF / CR 参数组合
         comboIdx = (comboIdx + 1) % COMBO_COUNT;
         applyLoRaConfig();
       } else if (evt == LONG_PRESS) {
-        // 长按：手动切换工作频率
+        // 长按：手动循环切换工作频率
         freqIdx = (freqIdx + 1) % FREQ_COUNT;
         currentFreq = FREQ_LIST[freqIdx];
         applyLoRaConfig();
@@ -195,15 +194,22 @@ void loop() {
         incoming += (char)LoRa.read();
       }
       
-      // 成功接收并解码：触发锁定模式
       isLocked = true;
-      decodedPayload = incoming;
+      
+      // APRS 报头过滤清洗
+      int aprsMsgIdx = incoming.indexOf("::");
+      if (aprsMsgIdx != -1) {
+        decodedPayload = incoming.substring(aprsMsgIdx + 2);
+      } else {
+        decodedPayload = incoming;
+      }
+
       lastPacketRssi = LoRa.packetRssi();
       lastPacketSnr = LoRa.packetSnr();
-      lockTimeMs = millis();
 
-      Serial.printf("[DEC] Received %d bytes: %s | RSSI: %d | SNR: %.2f\n", 
-                    packetSize, decodedPayload.c_str(), lastPacketRssi, lastPacketSnr);
+      Serial.printf("[DEC] Raw: %s\n", incoming.c_str());
+      Serial.printf("[DEC] Parsed: %s | RSSI: %d | SNR: %.2f\n", 
+                    decodedPayload.c_str(), lastPacketRssi, lastPacketSnr);
     }
 
     drawMainDisplay();
@@ -231,40 +237,48 @@ void sampleRSSI() {
 void drawMainDisplay() {
   display.clearDisplay();
 
-  // 1. 顶部状态栏
+  // 1. 顶部状态栏：左侧频率，右侧显示 [LOCKED] 或实时 RSSI
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.printf("%.3fMHz", currentFreq);
   
-  display.setCursor(80, 0);
+  display.setCursor(75, 0);
   if (isLocked) {
-    display.print("[LOCKED]"); // 显示锁定状态
+    display.print("[LOCKED]"); 
   } else {
-    display.print("[SCAN]");
+    int latestIdx = (rssiWrIdx - 1 + RSSI_HIST_LEN) % RSSI_HIST_LEN;
+    display.printf("%ddBm", (int)rssiHistory[latestIdx]);
   }
 
   // 2. 边框外壳
   display.drawRect(BOX_X - 1, BOX_Y - 1, BOX_W + 2, BOX_H + 2, SSD1306_WHITE);
 
-  // 3. 方框区内容（根据是否锁定进行显示切换）
+  // 3. 方框区内容
   if (isLocked) {
-    // === 锁定状态：方框区域内显示解码结果与包信息 ===
+    // === 锁定状态：显示解码数据与包信号状态 ===
     display.setTextSize(1);
+    display.setTextWrap(true);
     
-    // 显示解出的 Payload 文本 (超出长框会自动折行/裁剪)
-    display.setCursor(BOX_X + 2, BOX_Y + 2);
-    if (decodedPayload.length() > 0) {
-      display.println(decodedPayload.substring(0, 36)); // 最多显示前 36 个字符
-    } else {
-      display.println("<EMPTY PACKET>");
+    // 超长文本截断并用 ... 结尾
+    String dispText = decodedPayload;
+    if (dispText.length() > 33) {
+      dispText = dispText.substring(0, 30) + "...";
     }
 
-    // 方框底部显示收包信号参数 (RSSI & SNR)
+    display.setCursor(BOX_X + 2, BOX_Y + 2);
+    if (dispText.length() > 0) {
+      display.print(dispText);
+    } else {
+      display.print("<EMPTY>");
+    }
+
+    // 保持原本位置与格式显示 RSSI 和 SNR
     display.setCursor(BOX_X + 2, BOX_Y + 22);
     display.printf("R:%ddBm S:%.1fdB", lastPacketRssi, lastPacketSnr);
 
   } else {
-    // === 未锁定状态：方框内显示 RSSI 历史波形 ===
+    // === 未锁定状态：绘制 RSSI 历史时序波形 ===
+    display.setTextWrap(false);
     for (int col = 0; col < BOX_W; col++) {
       int idx = (rssiWrIdx + col) % RSSI_HIST_LEN;
       float val = rssiHistory[idx];
@@ -276,14 +290,14 @@ void drawMainDisplay() {
     }
   }
 
-  // 4. 底部状态栏
+  // 4. 底部状态栏：CR 简化显示（如 CR5）
   int bottomY = 52;
   display.setTextSize(1);
   display.setCursor(0, bottomY);
   display.printf("BW:%.0fK", signalBandwidth / 1000.0);
 
   char sfCrBuf[16];
-  snprintf(sfCrBuf, sizeof(sfCrBuf), "SF%d/CR4/%d", COMBO_LIST[comboIdx].sf, COMBO_LIST[comboIdx].cr);
+  snprintf(sfCrBuf, sizeof(sfCrBuf), "SF%d/CR%d", COMBO_LIST[comboIdx].sf, COMBO_LIST[comboIdx].cr);
   int xPos = SCREEN_WIDTH - (strlen(sfCrBuf) * 6);
   display.setCursor(xPos, bottomY);
   display.print(sfCrBuf);
@@ -330,6 +344,7 @@ void enterDeepSleep() {
   display.clearDisplay();
   display.display();
 
+  // 关机时关闭外设电源
   digitalWrite(VEXT_CTRL_PIN, HIGH);
 
   esp_sleep_enable_ext0_wakeup((gpio_num_t)PRG_BUTTON_PIN, 0);
