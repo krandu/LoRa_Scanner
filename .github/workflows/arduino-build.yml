@@ -41,11 +41,11 @@ jobs:
           arduino-cli config add board_manager.additional_urls \
             https://espressif.github.io/arduino-esp32/package_esp32_index.json
 
-      # ── 5. 更新索引 & 安装 ESP32 官方 Core ───────────────────
+      # ── 5. 更新索引 & 安装 ESP32 官方 Core (2.0.17 兼容版本) ──
       - name: Update index and install core
         run: |
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32
+          arduino-cli core install esp32:esp32@2.0.17
 
       # ── 6. 安装 Heltec 兼容依赖库 ────────────────────────────
       - name: Install libraries
