@@ -89,7 +89,7 @@ bool inMenu = false;
 int menuSelection = 0; 
 const int MENU_ITEMS = 2; 
 
-unsigned long lastLogMs = 0; // Log 打印控制
+unsigned long lastLogMs = 0; 
 
 void applyLoRaConfig();
 void runSpectrumScan();
@@ -141,7 +141,6 @@ void setup() {
     while (1);
   }
   
-  // 切换为连续接收模式以能够读取 RSSI
   LoRa.receive();
   Serial.println("[OK] SX1276 LoRa transceiver started successfully.");
 
@@ -216,7 +215,7 @@ void loop() {
   }
 }
 
-// 执行频谱扫描并打印调试日志
+// 频谱扫描逻辑（使用公开的 API: LoRa.rssi()）
 void runSpectrumScan() {
   float step = (SPEC_END_FREQ - SPEC_START_FREQ) / SPEC_CHANNELS;
   maxFoundRssi = -160.0;
@@ -225,17 +224,11 @@ void runSpectrumScan() {
   for (int i = 0; i < SPEC_CHANNELS; i++) {
     float freq = SPEC_START_FREQ + i * step;
     LoRa.setFrequency(freq * 1E6);
-    LoRa.receive(); // 切换回接收态以获取 RSSI
+    LoRa.receive(); 
     delayMicroseconds(2500); 
     
-    // 读取当前频点的 RSSI
-    float val = LoRa.packetRssi();
-    
-    // 如果读取到的 packetRssi 为 0，说明未获取到有效环境 RSSI，尝试从底层寄存器读取
-    if (val == 0 || val == -120.0) {
-      val = -137.0 + LoRa.readRegister(0x0F); // 0x0F 为 RegRssiValue (SX1276)
-    }
-    
+    // 使用官方公开 API 获取当前频点的环境/信道 RSSI
+    float val = LoRa.rssi();
     specRssi[i] = val;
 
     if (val > maxFoundRssi) {
@@ -247,7 +240,7 @@ void runSpectrumScan() {
     }
   }
 
-  // 1 秒输出一次串口 Log
+  // 1 秒输出一次调试 Log
   if (millis() - lastLogMs > 1000) {
     lastLogMs = millis();
     Serial.println("\n====== SPECTRUM SCAN DIAGNOSTIC LOG ======");
@@ -260,7 +253,7 @@ void runSpectrumScan() {
     Serial.println("\n===========================================");
   }
 
-  // 瀑布图向下平移更新
+  // 瀑布图数据更新
   int wfLines = WATERFALL_H - 2;
   for (int y = wfLines - 1; y > 0; y--) {
     for (int x = 0; x < SPEC_CHANNELS; x++) {
@@ -268,7 +261,6 @@ void runSpectrumScan() {
     }
   }
 
-  // 基于实际算出的底噪动态阶梯划分
   for (int x = 0; x < SPEC_CHANNELS; x++) {
     float delta = specRssi[x] - minFoundRssi;
     if (delta > 20.0)      waterfallBuf[0][x] = 2; // 强
@@ -299,7 +291,6 @@ void drawSpectrumDisplay() {
   int colWidth = (SPEC_BOX_W - 2) / SPEC_CHANNELS; 
 
   for (int i = 0; i < SPEC_CHANNELS; i++) {
-    // 根据底噪 minFoundRssi 到最高可承载的 -30dBm 映射
     int lineH = map((int)constrain(specRssi[i], minFoundRssi, -30.0), (int)minFoundRssi, -30, 1, innerH);
     int xPos = innerX + i * colWidth;
     if (lineH > 0) {
@@ -329,7 +320,7 @@ void drawSpectrumDisplay() {
     }
   }
 
-  // 3. 底部状态栏 (STEP 在右下角左对齐)
+  // 3. 底部状态栏
   display.setCursor(0, 56);
   display.print("SPAN:10M");
 
@@ -348,8 +339,7 @@ void applyLoRaConfig() {
 }
 
 void sampleRSSI() {
-  float rawRssi = LoRa.packetRssi(); 
-  if (rawRssi == 0) rawRssi = -137.0 + LoRa.readRegister(0x0F);
+  float rawRssi = LoRa.rssi(); 
   rssiHistory[rssiWrIdx] = rawRssi;
   rssiWrIdx = (rssiWrIdx + 1) % RSSI_HIST_LEN;
 }
