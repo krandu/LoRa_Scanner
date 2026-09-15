@@ -1,1 +1,79 @@
+name: Arduino Build
 
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - "**.ino"
+      - "**.h"
+      - "**.cpp"
+      - ".github/workflows/arduino-build.yml"
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:   # 允许手动触发
+
+jobs:
+  build:
+    name: Compile — Heltec WiFi LoRa 32 V2
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. 检出代码 ──────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. 安装 arduino-cli ──────────────────────────────────
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v1
+
+      # ── 3. 添加 Heltec ESP32 Board Manager URL ───────────────
+      - name: Configure arduino-cli
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls \
+            https://resource.heltec.cn/download/package_heltec_esp32_index.json
+
+      # ── 4. 更新索引 ──────────────────────────────────────────
+      - name: Update board index
+        run: arduino-cli core update-index
+
+      # ── 5. 安装 Heltec ESP32 核心 ────────────────────────────
+      - name: Install Heltec ESP32 core
+        run: arduino-cli core install Heltec-esp32:esp32
+
+      # ── 6. 安装依赖库 ────────────────────────────────────────
+      - name: Install libraries
+        run: |
+          arduino-cli lib install "Heltec ESP32 Dev-Boards"
+          arduino-cli lib install "LoRa"
+
+      # ── 7. 编译 ──────────────────────────────────────────────
+      - name: Compile sketch
+        run: |
+          arduino-cli compile \
+            --fqbn Heltec-esp32:esp32:WiFiLoRa32V2 \
+            --warnings default \
+            --output-dir build/ \
+            LoRa_Scanner/LoRa_Scanner.ino
+
+      # ── 8. 上传编译产物（.bin / .elf）────────────────────────
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: LoRa_Scanner-firmware
+          path: |
+            build/*.bin
+            build/*.elf
+            build/*.map
+          retention-days: 30
+
+      # ── 9. 打印固件大小 ──────────────────────────────────────
+      - name: Print firmware size
+        run: |
+          echo "=== Firmware files ==="
+          ls -lh build/*.bin 2>/dev/null || echo "No .bin found"
+          BIN=$(ls build/*.bin 2>/dev/null | head -1)
+          if [ -n "$BIN" ]; then
+            SIZE=$(stat -c%s "$BIN")
+            echo "Binary size: ${SIZE} bytes ($(( SIZE / 1024 )) KB)"
+          fi
