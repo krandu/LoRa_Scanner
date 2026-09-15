@@ -27,10 +27,12 @@ jobs:
       - name: Install arduino-cli
         uses: arduino/setup-arduino-cli@v1
 
-      # ── 3. 安装 Python 工具（esptool + spiffsgen-python）────────────
+      # ── 3. 安装 Python 工具（esptool & 下载 spiffsgen.py）────
       - name: Install Python tools
         run: |
-          pip install esptool spiffsgen-python --quiet
+          pip install esptool --quiet
+          curl -sSL https://raw.githubusercontent.com/espressif/esp-idf/master/components/spiffs/spiffsgen.py -o /usr/local/bin/spiffsgen.py
+          chmod +x /usr/local/bin/spiffsgen.py
 
       # ── 4. 配置 Board Manager URL ────────────────────────────
       - name: Configure arduino-cli
