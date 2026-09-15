@@ -9,11 +9,11 @@
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 64
 
-#define VEXT_CTRL_PIN 21   // 控制屏幕及电池分压电路供电
+#define VEXT_CTRL_PIN 21   // 控制屏幕及电池分压电路供电 (LOW 为激活)
 #define OLED_SDA      4
 #define OLED_SCL      15
 #define OLED_RST      16 
-#define VBAT_ADC_PIN  37   // Heltec V2 电池采样引脚 (ADC1_CH1)
+#define VBAT_ADC_PIN  37   // Heltec V2 板载电池采样引脚 (ADC1_CH1)
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 
@@ -99,9 +99,7 @@ bool isWaitingForClick = false;
 
 bool inMenu = false;
 int menuSelection = 0; 
-const int MENU_ITEMS = 3; // 增加了关机选项
-
-unsigned long lastLogMs = 0; 
+const int MENU_ITEMS = 3; 
 
 // 函数声明
 void applyLoRaConfig();
@@ -122,7 +120,7 @@ void setup() {
 
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
-  // 开启 VEXT (低电平开启屏幕及部分传感器供电)
+  // 开启 VEXT (低电平开启屏幕及分压测量电路供电)
   pinMode(VEXT_CTRL_PIN, OUTPUT);
   digitalWrite(VEXT_CTRL_PIN, LOW); 
   delay(50);
@@ -273,9 +271,7 @@ void runSpectrumScan() {
     }
   }
 
-  // ===== 峰值防抖抖动算法 =====
-  // 1. 如果检测到的新峰值比当前显示的峰值强 3.0 dBm 以上，立刻更新
-  // 2. 如果维持超过 1.5 秒，允许更新为当前最新峰值（避免锁定在偶发的尖峰上）
+  // 峰值防抖算法：新峰值高于原峰值 3.0 dBm 或保持超 1.5 秒后更新
   if ((maxFoundRssi > displayedPeakRssi + 3.0) || (millis() - lastPeakUpdateMs > 1500)) {
     displayedPeakFreq = rawPeakFreq;
     displayedPeakRssi = maxFoundRssi;
@@ -311,11 +307,14 @@ void drawSpectrumDisplay() {
   display.setCursor(52, 0);
   display.print(peakBuf);
 
-  // 显示电量百分比
+  // 显示右对齐电量百分比
   float vbat = readBatteryVoltage();
   int pct = getBatteryPercent(vbat);
-  display.setCursor(102, 0);
-  display.printf("%d%%", pct);
+  char batStr[8];
+  snprintf(batStr, sizeof(batStr), "%d%%", pct);
+  int batX = SCREEN_WIDTH - (strlen(batStr) * 6);
+  display.setCursor(batX, 0);
+  display.print(batStr);
 
   // 1. 频谱柱状图
   display.drawRect(SPEC_BOX_X, SPEC_BOX_Y, SPEC_BOX_W, SPEC_BOX_H, SSD1306_WHITE);
@@ -382,11 +381,14 @@ void drawMainDisplay() {
   display.setCursor(0, 0);
   display.printf("%.3fM", currentFreq);
   
-  // 右上角显示电池电量
+  // 显示右对齐电量百分比
   float vbat = readBatteryVoltage();
   int pct = getBatteryPercent(vbat);
-  display.setCursor(98, 0);
-  display.printf("%d%%", pct);
+  char batStr[8];
+  snprintf(batStr, sizeof(batStr), "%d%%", pct);
+  int batX = SCREEN_WIDTH - (strlen(batStr) * 6);
+  display.setCursor(batX, 0);
+  display.print(batStr);
 
   display.drawRect(BOX_X - 1, BOX_Y - 1, BOX_W + 2, BOX_H + 2, SSD1306_WHITE);
 
@@ -466,17 +468,22 @@ void drawMenuDisplay() {
   display.display();
 }
 
-// 电池电压读取 (针对 Heltec V2 分压电阻电路优化)
+// 电池电压读取 (修正控制通电与分压系数)
 float readBatteryVoltage() {
-  // 读取 10 次取平均值降低噪声
+  // 确保 Vext (GPIO 21) 输出低电平以激活分压采样电路
+  pinMode(VEXT_CTRL_PIN, OUTPUT);
+  digitalWrite(VEXT_CTRL_PIN, LOW);
+  delay(2); // 等待电压稳定
+
+  // 读取 10 次取平均值降低采样噪声
   int rawSum = 0;
   for (int i = 0; i < 10; i++) {
     rawSum += analogRead(VBAT_ADC_PIN);
   }
   float raw = rawSum / 10.0;
   
-  // 3.3V / 4095 解算，再乘以板载分压倍数 (约 3.2 ~ 4.2 换算)
-  float voltage = (raw / 4095.0) * 3.3 * 2.0; 
+  // Heltec V2 采样点使用了 100K/220K 分压，对应系数约为 3.2
+  float voltage = (raw / 4095.0) * 3.3 * 3.2; 
   return voltage;
 }
 
@@ -499,7 +506,7 @@ void powerOff() {
   display.clearDisplay();
   display.display();
 
-  // 关闭外设电源线
+  // 关闭屏幕及外设供电
   digitalWrite(VEXT_CTRL_PIN, HIGH); 
   
   // 进入深度睡眠
