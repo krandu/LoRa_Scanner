@@ -88,12 +88,18 @@ jobs:
             --block-size 4096
           echo "SPIFFS image created."
 
-      # ── 9. 智能搜索并合并固件 (兼容 esptool v5+) ────────────
+      # ── 9. 智能搜索并合并固件 (兼容 esptool v5+ 语法) ───────────
       - name: Merge firmware (merged-firmware.bin)
         run: |
-          # 全局搜索 arduino 缓存和 build 目录中的 bootloader 与 partitions 文件
-          BOOT=$(find /home/runner/.arduino15/ build/ -name "*bootloader*.bin" | head -1)
-          PART=$(find build/ /home/runner/.arduino15/ -name "*.partitions.bin" -o -name "partitions.bin" | head -1)
+          # 优先在 build/ 目录精准匹配 arduino-cli 导出的当前板子 bootloader
+          BOOT=$(find build/ -name "*.bootloader.bin" | head -1)
+          
+          # 如果 build/ 下没找到，再降级去查找 esp32 默认的标准 bootloader
+          if [ -z "$BOOT" ]; then
+            BOOT=$(find /home/runner/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/sdk/esp32/bin/ -name "bootloader_*.bin" | head -1)
+          fi
+
+          PART=$(find build/ -name "*.partitions.bin" -o -name "partitions.bin" | head -1)
           BAPP=$(find /home/runner/.arduino15/ -name "boot_app0.bin" | head -1)
           APP=$(find build/ -name "*.ino.bin" ! -name "*bootloader*" ! -name "*partitions*" | head -1)
 
@@ -103,14 +109,14 @@ jobs:
           echo "Found app        : $APP"
           echo "Found spiffs     : build/spiffs.bin"
 
-          if [ -z "$BOOT" ] || [ -z "$PART" ] || [ -z "$BAPP" ]; then
+          if [ -z "$BOOT" ] || [ -z "$PART" ] || [ -z "$BAPP" ] || [ -z "$APP" ]; then
             echo "Error: Could not locate all required bin files for merging."
             exit 1
           fi
 
-          # 适配 esptool v5+ 新语法格式
-          esptool merge-bin \
-            --chip esp32 \
+          # 注意：esptool v5 要求 --chip 等参数写在 merge-bin 子命令之前
+          esptool --chip esp32 \
+            merge-bin \
             --output build/merged-firmware.bin \
             --flash-mode dio \
             --flash-freq 80m \
