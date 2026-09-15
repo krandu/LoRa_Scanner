@@ -25,33 +25,41 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 
 #define PRG_BUTTON_PIN 0 
 
-// ================= 频率与参数列表 =================
+// ================= 运行模式定义 =================
+enum SystemMode { MODE_SPECTRUM, MODE_LORA_ANALYZER };
+SystemMode currentMode = MODE_SPECTRUM; // 默认启动为频谱分析模式
+
+// ================= 频谱扫描配置 (430MHz - 440MHz) =================
+#define SPEC_START_FREQ  430.0
+#define SPEC_END_FREQ    440.0
+#define SPEC_CHANNELS    40     // 40 个通道 (步长 250kHz)
+#define SPEC_BOX_X       4
+#define SPEC_BOX_Y       12
+#define SPEC_BOX_W       120
+#define SPEC_BOX_H       20
+#define WATERFALL_Y      34
+#define WATERFALL_H      16
+
+float specRssi[SPEC_CHANNELS];
+uint8_t waterfallBuf[WATERFALL_H][SPEC_CHANNELS]; // 瀑布图历史数据缓存
+
+float peakRssiFreq = 430.0;
+float maxFoundRssi = -120.0;
+
+// ================= LoRa 模式配置与缓冲区 =================
 const float FREQ_LIST[] = { 438.150, 438.125, 438.000, 438.500 }; 
 const int FREQ_COUNT = sizeof(FREQ_LIST) / sizeof(FREQ_LIST[0]);
 int freqIdx = 0;
 float currentFreq = FREQ_LIST[0];
-
 long signalBandwidth = 125E3; // 125kHz
 
-struct LoRaCombo {
-  uint8_t sf;
-  uint8_t cr;
-};
-
+struct LoRaCombo { uint8_t sf; uint8_t cr; };
 const LoRaCombo COMBO_LIST[] = {
-  {12, 5}, // 默认首选 SF12 / CR5
-  {7,  5},
-  {8,  5},
-  {9,  5},
-  {10, 5},
-  {11, 5},
-  {7,  8},
-  {12, 8}
+  {12, 5}, {7, 5}, {8, 5}, {9, 5}, {10, 5}, {11, 5}, {7, 8}, {12, 8}
 };
 const int COMBO_COUNT = sizeof(COMBO_LIST) / sizeof(COMBO_LIST[0]);
 int comboIdx = 0; 
 
-// ================= 信号与解码数据缓冲区 =================
 #define BOX_X 8
 #define BOX_Y 12
 #define BOX_W 112
@@ -62,13 +70,12 @@ float rssiHistory[RSSI_HIST_LEN];
 int rssiWrIdx = 0;
 unsigned long lastSampleMs = 0;
 
-// 信号锁定与解码结果存储
-bool isLocked = false;             // 锁定状态标志
-String decodedPayload = "";        // 清洗解码后的文本数据
-int lastPacketRssi = 0;            // 解码数据包的 RSSI
-float lastPacketSnr = 0.0;         // 解码数据包的 SNR
+bool isLocked = false;
+String decodedPayload = "";
+int lastPacketRssi = 0;
+float lastPacketSnr = 0.0;
 
-// ================= 按键检测状态机 =================
+// ================= 按键状态机 =================
 enum BtnEvent { NONE, SINGLE_CLICK, DOUBLE_CLICK, LONG_PRESS };
 unsigned long btnPressTime = 0;
 unsigned long lastReleaseTime = 0;
@@ -78,12 +85,14 @@ bool isWaitingForClick = false;
 // ================= 菜单系统 =================
 bool inMenu = false;
 int menuSelection = 0; 
-const int MENU_ITEMS = 2;
+const int MENU_ITEMS = 2; // 0: 频谱分析, 1: LoRa 模式
 
 // ================= 函数声明 =================
 void applyLoRaConfig();
+void runSpectrumScan();
 void sampleRSSI();
 void drawMainDisplay();
+void drawSpectrumDisplay();
 void drawMenuDisplay();
 BtnEvent checkButton();
 void enterDeepSleep();
@@ -92,7 +101,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
-  // 1. 开启外设电源 VEXT (GPIO 21 拉低)
+  // 1. 开启外设电源 VEXT
   pinMode(VEXT_CTRL_PIN, OUTPUT);
   digitalWrite(VEXT_CTRL_PIN, LOW); 
   delay(50);
@@ -130,90 +139,166 @@ void setup() {
   }
 
   for (int i = 0; i < RSSI_HIST_LEN; i++) rssiHistory[i] = -120.0;
+  memset(waterfallBuf, 0, sizeof(waterfallBuf));
 
-  applyLoRaConfig();
+  if (currentMode == MODE_LORA_ANALYZER) {
+    applyLoRaConfig();
+  }
 }
 
 void loop() {
   BtnEvent evt = checkButton();
 
-  // 双击：切换系统菜单 / 主界面
+  // 双击：唤出模式切换菜单
   if (evt == DOUBLE_CLICK) {
     inMenu = !inMenu;
+    if (inMenu) menuSelection = (currentMode == MODE_SPECTRUM) ? 0 : 1;
   }
 
   if (inMenu) {
-    // ---- 菜单模式 ----
+    // ---- 模式切换菜单模式 ----
     if (evt == SINGLE_CLICK) {
       menuSelection = (menuSelection + 1) % MENU_ITEMS;
     } else if (evt == LONG_PRESS) {
       if (menuSelection == 0) {
-        ESP.restart();
+        currentMode = MODE_SPECTRUM;
       } else if (menuSelection == 1) {
-        enterDeepSleep();
+        currentMode = MODE_LORA_ANALYZER;
+        applyLoRaConfig();
       }
+      inMenu = false; // 切换并退出菜单
     }
     drawMenuDisplay();
-  } else {
-    // ---- 主显示运行模式 ----
-    
-    // 1. 锁定状态下的按键控制
+  } 
+  else if (currentMode == MODE_SPECTRUM) {
+    // ---- 频谱分析模式 ----
+    runSpectrumScan();
+    drawSpectrumDisplay();
+  } 
+  else {
+    // ---- LoRa 接收分析模式 ----
     if (isLocked) {
       if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
-        // 解除锁定：按键直接退出锁定，恢复常规扫描
         isLocked = false;
         decodedPayload = "";
-        Serial.println("[System] Unlocked by user.");
       }
-    } 
-    // 2. 未锁定状态下的按键控制
-    else {
+    } else {
       if (evt == SINGLE_CLICK) {
-        // 短按：循环切换 SF / CR 参数组合
         comboIdx = (comboIdx + 1) % COMBO_COUNT;
         applyLoRaConfig();
       } else if (evt == LONG_PRESS) {
-        // 长按：手动循环切换工作频率
         freqIdx = (freqIdx + 1) % FREQ_COUNT;
         currentFreq = FREQ_LIST[freqIdx];
         applyLoRaConfig();
       }
     }
 
-    // 定时采样 RSSI 记录走势
     if (millis() - lastSampleMs >= 30) {
       lastSampleMs = millis();
       sampleRSSI();
     }
 
-    // 3. 尝试接收解析 LoRa 数据包
     int packetSize = LoRa.parsePacket();
     if (packetSize) {
       String incoming = "";
-      while (LoRa.available()) {
-        incoming += (char)LoRa.read();
-      }
+      while (LoRa.available()) incoming += (char)LoRa.read();
       
       isLocked = true;
-      
-      // APRS 报头过滤清洗
       int aprsMsgIdx = incoming.indexOf("::");
-      if (aprsMsgIdx != -1) {
-        decodedPayload = incoming.substring(aprsMsgIdx + 2);
-      } else {
-        decodedPayload = incoming;
-      }
+      decodedPayload = (aprsMsgIdx != -1) ? incoming.substring(aprsMsgIdx + 2) : incoming;
 
       lastPacketRssi = LoRa.packetRssi();
       lastPacketSnr = LoRa.packetSnr();
-
-      Serial.printf("[DEC] Raw: %s\n", incoming.c_str());
-      Serial.printf("[DEC] Parsed: %s | RSSI: %d | SNR: %.2f\n", 
-                    decodedPayload.c_str(), lastPacketRssi, lastPacketSnr);
     }
 
     drawMainDisplay();
   }
+}
+
+// 快速全频段 RSSI 扫描
+void runSpectrumScan() {
+  float step = (SPEC_END_FREQ - SPEC_START_FREQ) / SPEC_CHANNELS;
+  maxFoundRssi = -120.0;
+
+  for (int i = 0; i < SPEC_CHANNELS; i++) {
+    float freq = SPEC_START_FREQ + i * step;
+    LoRa.setFrequency(freq * 1E6);
+    delayMicroseconds(2500); // 频点切换建立延时
+    
+    float val = LoRa.packetRssi();
+    if (val == 0) val = -120.0;
+    specRssi[i] = val;
+
+    if (val > maxFoundRssi) {
+      maxFoundRssi = val;
+      peakRssiFreq = freq;
+    }
+  }
+
+  // 瀑布图向下平移更新
+  for (int y = WATERFALL_H - 1; y > 0; y--) {
+    for (int x = 0; x < SPEC_CHANNELS; x++) {
+      waterfallBuf[y][x] = waterfallBuf[y - 1][x];
+    }
+  }
+
+  // 编码顶行瀑布图数值 (0: 弱, 1: 中, 2: 强)
+  for (int x = 0; x < SPEC_CHANNELS; x++) {
+    if (specRssi[x] > -75)       waterfallBuf[0][x] = 2;
+    else if (specRssi[x] > -95)  waterfallBuf[0][x] = 1;
+    else                         waterfallBuf[0][x] = 0;
+  }
+}
+
+// 绘制频谱图 + 瀑布图界面
+void drawSpectrumDisplay() {
+  display.clearDisplay();
+
+  // 1. 顶部状态栏: 显示范围与峰值频点
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("430-440M");
+  
+  char peakBuf[16];
+  snprintf(peakBuf, sizeof(peakBuf), "PK:%.2f", peakRssiFreq);
+  int peakX = SCREEN_WIDTH - (strlen(peakBuf) * 6);
+  display.setCursor(peakX, 0);
+  display.print(peakBuf);
+
+  // 2. 频谱柱状图 (SPEC_BOX_X 到 SPEC_BOX_X + 120)
+  int colWidth = SPEC_BOX_W / SPEC_CHANNELS; // 3px 每通道
+  for (int i = 0; i < SPEC_CHANNELS; i++) {
+    int lineH = map((int)constrain(specRssi[i], -115, -30), -115, -30, 0, SPEC_BOX_H);
+    int xPos = SPEC_BOX_X + i * colWidth;
+    if (lineH > 0) {
+      display.fillRect(xPos, SPEC_BOX_Y + SPEC_BOX_H - lineH, colWidth - 1, lineH, SSD1306_WHITE);
+    }
+  }
+  display.drawFastHLine(SPEC_BOX_X - 2, SPEC_BOX_Y + SPEC_BOX_H, SPEC_BOX_W + 4, SSD1306_WHITE);
+
+  // 3. 瀑布图绘制
+  for (int y = 0; y < WATERFALL_H; y++) {
+    for (int i = 0; i < SPEC_CHANNELS; i++) {
+      int xPos = SPEC_BOX_X + i * colWidth;
+      uint8_t val = waterfallBuf[y][i];
+
+      if (val == 2) {
+        // 强信号：完全点亮像素块
+        display.fillRect(xPos, WATERFALL_Y + y, colWidth - 1, 1, SSD1306_WHITE);
+      } else if (val == 1) {
+        // 中等信号：抖动点阵 (间隔点亮)
+        if ((i + y) % 2 == 0) {
+          display.drawPixel(xPos, WATERFALL_Y + y, SSD1306_WHITE);
+        }
+      }
+    }
+  }
+
+  // 4. 底部扫描信息栏
+  display.setCursor(0, 56);
+  display.printf("SPAN:10M STEP:250K");
+
+  display.display();
 }
 
 void applyLoRaConfig() {
@@ -222,9 +307,6 @@ void applyLoRaConfig() {
   LoRa.setSpreadingFactor(COMBO_LIST[comboIdx].sf);
   LoRa.setCodingRate4(COMBO_LIST[comboIdx].cr);
   LoRa.receive();
-  
-  Serial.printf("[LoRa Config] Freq: %.3f MHz | SF: %d | CR: 4/%d\n", 
-                currentFreq, COMBO_LIST[comboIdx].sf, COMBO_LIST[comboIdx].cr);
 }
 
 void sampleRSSI() {
@@ -242,7 +324,6 @@ void drawMainDisplay() {
   display.setCursor(0, 0);
   display.printf("%.3fMHz", currentFreq);
   
-  // 右上角内容：计算字符长度并像素靠右对齐 (屏幕总宽 128)
   char rightTopBuf[16];
   if (isLocked) {
     snprintf(rightTopBuf, sizeof(rightTopBuf), "[LOCKED]");
@@ -259,24 +340,15 @@ void drawMainDisplay() {
 
   // 3. 方框区内容
   if (isLocked) {
-    // === 锁定状态：严格控制多行文本边界，避免溢出 ===
     display.setTextSize(1);
-    display.setTextWrap(false); // 手动控制换行，防止长单词越界
+    display.setTextWrap(false);
 
-    // 每行最多容纳 17 个字符 (112px / 6px = 18.6)
-    String line1 = "";
-    String line2 = "";
-
+    String line1 = "", line2 = "";
     if (decodedPayload.length() <= 17) {
       line1 = decodedPayload;
     } else {
       line1 = decodedPayload.substring(0, 17);
-      if (decodedPayload.length() > 32) {
-        // 超长文本：截取 15 字符 + ...
-        line2 = decodedPayload.substring(17, 31) + "...";
-      } else {
-        line2 = decodedPayload.substring(17);
-      }
+      line2 = (decodedPayload.length() > 32) ? (decodedPayload.substring(17, 31) + "...") : decodedPayload.substring(17);
     }
 
     display.setCursor(BOX_X + 2, BOX_Y + 2);
@@ -287,38 +359,28 @@ void drawMainDisplay() {
       display.print(line2);
     }
 
-    // 底部固定显示 RSSI 和 SNR
     display.setCursor(BOX_X + 2, BOX_Y + 22);
     display.printf("R:%ddBm S:%.1fdB", lastPacketRssi, lastPacketSnr);
 
   } else {
-    // === 未锁定状态：绘制 RSSI 动态波形（以当前最低底噪为 X 轴基线）===
     display.setTextWrap(false);
-
-    // 寻找当前历史记录里的最低 RSSI 作为动态底噪起点
     float minRssi = 0.0;
     for (int i = 0; i < RSSI_HIST_LEN; i++) {
-      if (rssiHistory[i] < minRssi) {
-        minRssi = rssiHistory[i];
-      }
+      if (rssiHistory[i] < minRssi) minRssi = rssiHistory[i];
     }
-    if (minRssi > -60.0) minRssi = -120.0; // 防止极端情况下的除零或基线失真
-
-    float maxRssi = -30.0; // 固定最高顶格阀值
+    if (minRssi > -60.0) minRssi = -120.0;
 
     for (int col = 0; col < BOX_W; col++) {
       int idx = (rssiWrIdx + col) % RSSI_HIST_LEN;
       float val = rssiHistory[idx];
-      
-      // 以最低底噪 minRssi 为起点映射柱状图高度
-      int lineH = map((int)constrain(val, minRssi, maxRssi), (int)minRssi, (int)maxRssi, 0, BOX_H - 1);
+      int lineH = map((int)constrain(val, minRssi, -30.0), (int)minRssi, -30, 0, BOX_H - 1);
       if (lineH > 0) {
         display.drawFastVLine(BOX_X + col, BOX_Y + BOX_H - lineH, lineH, SSD1306_WHITE);
       }
     }
   }
 
-  // 4. 底部状态栏：CR5 简化显示
+  // 4. 底部状态栏
   int bottomY = 52;
   display.setTextSize(1);
   display.setCursor(0, bottomY);
@@ -333,12 +395,13 @@ void drawMainDisplay() {
   display.display();
 }
 
+// 绘制模式选择菜单
 void drawMenuDisplay() {
   display.clearDisplay();
   
   display.setTextSize(1);
-  display.setCursor(32, 4);
-  display.println("= SYSTEM MENU =");
+  display.setCursor(20, 4);
+  display.println("= SELECT MODE =");
   display.drawFastHLine(0, 16, 128, SSD1306_WHITE);
 
   if (menuSelection == 0) {
@@ -348,7 +411,7 @@ void drawMenuDisplay() {
     display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
   }
   display.setCursor(15, 27);
-  display.println("1. Reboot System");
+  display.println("1. Spectrum Scanner");
 
   if (menuSelection == 1) {
     display.fillRect(10, 42, 108, 14, SSD1306_WHITE);
@@ -357,26 +420,10 @@ void drawMenuDisplay() {
     display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
   }
   display.setCursor(15, 45);
-  display.println("2. Deep Sleep (OFF)");
+  display.println("2. LoRa Receiver");
 
   display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
   display.display();
-}
-
-void enterDeepSleep() {
-  display.clearDisplay();
-  display.setCursor(30, 28);
-  display.println("Powering Off...");
-  display.display();
-  delay(1000);
-  display.clearDisplay();
-  display.display();
-
-  // 关机时关闭外设电源
-  digitalWrite(VEXT_CTRL_PIN, HIGH);
-
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)PRG_BUTTON_PIN, 0);
-  esp_deep_sleep_start();
 }
 
 BtnEvent checkButton() {
