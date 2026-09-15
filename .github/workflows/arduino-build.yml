@@ -57,7 +57,7 @@ jobs:
           arduino-cli lib install "Heltec ESP32 Dev-Boards"
           arduino-cli lib install "LoRa"
 
-      # ── 8. 自动探测 FQBN 并指定 spiffs/partitions.csv 编译 ────
+      # ── 8. 覆盖板包默认分区表并编译 ────────────────────────────
       - name: Compile sketch
         run: |
           FQBN=$(arduino-cli board listall | grep -i "WiFiLoRa32.*V2" | awk '{print $NF}' | head -1)
@@ -74,14 +74,17 @@ jobs:
           echo "FQBN=$FQBN" >> $GITHUB_ENV
           echo "Using FQBN: $FQBN"
 
-          PART_PATH="$(pwd)/spiffs/partitions.csv"
+          # 寻找 Heltec 开发板存放 partitions 的目录，并用本地 spiffs/partitions.csv 覆盖默认的分区表
+          PART_DIR=$(find /home/runner/.arduino15/packages/Heltec-esp32/hardware/esp32/ -type d -name "partitions" | head -1)
+          if [ -d "$PART_DIR" ]; then
+            echo "Copying custom partitions.csv to $PART_DIR/default.csv"
+            cp spiffs/partitions.csv "$PART_DIR/default.csv"
+          fi
 
           arduino-cli compile \
             --fqbn "$FQBN" \
             --warnings default \
             --export-binaries \
-            --build-property "build.partitions=custom" \
-            --build-property "build.custom_partitions=$PART_PATH" \
             --build-property "upload.maximum_size=3342336" \
             --output-dir build/ \
             LoRa_Scanner/LoRa_Scanner.ino
