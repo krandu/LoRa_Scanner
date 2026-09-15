@@ -7,10 +7,11 @@ on:
       - "**.ino"
       - "**.h"
       - "**.cpp"
+      - "**.csv"
       - ".github/workflows/arduino-build.yml"
   pull_request:
     branches: [ "main", "master" ]
-  workflow_dispatch:   # 允许手动触发
+  workflow_dispatch:
 
 jobs:
   build:
@@ -26,54 +27,162 @@ jobs:
       - name: Install arduino-cli
         uses: arduino/setup-arduino-cli@v1
 
-      # ── 3. 添加 Heltec ESP32 Board Manager URL ───────────────
+      # ── 3. 安装 Python 工具（esptool + spiffsgen）────────────
+      - name: Install Python tools
+        run: |
+          pip install esptool spiffsgen --quiet
+
+      # ── 4. 配置 Board Manager URL ────────────────────────────
       - name: Configure arduino-cli
         run: |
           arduino-cli config init
           arduino-cli config add board_manager.additional_urls \
             https://resource.heltec.cn/download/package_heltec_esp32_index.json
 
-      # ── 4. 更新索引 ──────────────────────────────────────────
-      - name: Update board index
-        run: arduino-cli core update-index
+      # ── 5. 更新索引 & 安装核心 ───────────────────────────────
+      - name: Update index and install core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install Heltec-esp32:esp32
 
-      # ── 5. 安装 Heltec ESP32 核心 ────────────────────────────
-      - name: Install Heltec ESP32 core
-        run: arduino-cli core install Heltec-esp32:esp32
+      # ── 6. 列出已安装板子（确认 FQBN）───────────────────────
+      - name: List installed boards
+        run: arduino-cli board listall | grep -i heltec || true
 
-      # ── 6. 安装依赖库 ────────────────────────────────────────
+      # ── 7. 安装依赖库 ────────────────────────────────────────
       - name: Install libraries
         run: |
           arduino-cli lib install "Heltec ESP32 Dev-Boards"
           arduino-cli lib install "LoRa"
 
-      # ── 7. 编译 ──────────────────────────────────────────────
+      # ── 8. 自动探测 FQBN 并编译 ─────────────────────────────
+      #
+      #   --export-binaries  让 arduino-cli 把 bootloader.bin /
+      #   partitions.bin / boot_app0.bin 一并输出到 build/ 目录，
+      #   这样后续合并时用的是和本次编译完全匹配的文件。
+      #
       - name: Compile sketch
         run: |
+          FQBN=$(arduino-cli board listall | grep -i "WiFiLoRa32.*V2" | awk '{print $NF}' | head -1)
+          if [ -z "$FQBN" ]; then
+            for C in \
+              "Heltec-esp32:esp32:WIFI_LoRa_32_V2" \
+              "Heltec-esp32:esp32:heltec_wifi_lora_32_V2" \
+              "Heltec-esp32:esp32:WiFiLoRa32V2" \
+              "esp32:esp32:heltec_wifi_lora_32_V2"
+            do
+              arduino-cli board listall | grep -q "$C" && FQBN="$C" && break
+            done
+          fi
+          echo "FQBN=$FQBN" >> $GITHUB_ENV
+          echo "Using FQBN: $FQBN"
+
           arduino-cli compile \
-            --fqbn Heltec-esp32:esp32:WiFiLoRa32V2 \
+            --fqbn "$FQBN" \
             --warnings default \
+            --export-binaries \
+            --build-property "build.partitions=partitions" \
+            --build-property "upload.maximum_size=3342336" \
             --output-dir build/ \
             LoRa_Scanner/LoRa_Scanner.ino
 
-      # ── 8. 上传编译产物（.bin / .elf）────────────────────────
-      - name: Upload build artifacts
+      # ── 9. 列出 build 目录内容（调试用）─────────────────────
+      - name: List build outputs
+        run: ls -lh build/
+
+      # ── 10. 生成 SPIFFS 镜像 ─────────────────────────────────
+      #
+      #   spiffs/ 目录放需要打包进文件系统的资源文件（可为空）。
+      #   大小 0x180000 = 1572864 字节，与 partitions.csv 对应。
+      #   page=256 block=4096 是 ESP32 Flash 标准参数。
+      #
+      - name: Generate SPIFFS image
+        run: |
+          mkdir -p spiffs
+          # 如果 spiffs/ 目录里有文件会一起打包，空目录也可正常生成
+          spiffsgen.py \
+            1572864 \
+            spiffs/ \
+            build/spiffs.bin \
+            --page-size 256 \
+            --block-size 4096
+          echo "SPIFFS image:"
+          ls -lh build/spiffs.bin
+
+      # ── 11. 合并成单一可烧录固件 ─────────────────────────────
+      #
+      #   地址布局（8MB Flash）：
+      #     0x1000  bootloader
+      #     0x8000  分区表
+      #     0xe000  boot_app0
+      #     0x10000 应用程序
+      #     0x670000 SPIFFS
+      #
+      - name: Merge firmware (merged-firmware.bin)
+        run: |
+          # 定位编译产物（arduino-cli 输出路径含 fqbn 子目录）
+          BOOT=$(find build/ -name "bootloader.bin"  | head -1)
+          PART=$(find build/ -name "partitions.bin"  | head -1)
+          BAPP=$(find build/ -name "boot_app0.bin"   | head -1)
+          APP=$(find build/  -name "*.ino.bin" ! -name "*bootloader*" ! -name "*partitions*" | head -1)
+
+          echo "bootloader : $BOOT"
+          echo "partitions : $PART"
+          echo "boot_app0  : $BAPP"
+          echo "app        : $APP"
+          echo "spiffs     : build/spiffs.bin"
+
+          esptool.py --chip esp32 merge_bin \
+            --output build/merged-firmware.bin \
+            --flash_mode dio \
+            --flash_freq 80m \
+            --flash_size 8MB \
+            0x1000   "$BOOT" \
+            0x8000   "$PART" \
+            0xe000   "$BAPP" \
+            0x10000  "$APP"  \
+            0x670000 build/spiffs.bin
+
+          echo "=== merged-firmware.bin ==="
+          ls -lh build/merged-firmware.bin
+
+      # ── 12. 上传所有产物 ─────────────────────────────────────
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
           name: LoRa_Scanner-firmware
           path: |
-            build/*.bin
-            build/*.elf
-            build/*.map
+            build/merged-firmware.bin
+            build/spiffs.bin
+            build/*.ino.bin
+            build/*.ino.elf
+            build/*.ino.map
           retention-days: 30
 
-      # ── 9. 打印固件大小 ──────────────────────────────────────
-      - name: Print firmware size
+      # ── 13. 打印固件摘要 ─────────────────────────────────────
+      - name: Firmware summary
         run: |
-          echo "=== Firmware files ==="
-          ls -lh build/*.bin 2>/dev/null || echo "No .bin found"
-          BIN=$(ls build/*.bin 2>/dev/null | head -1)
-          if [ -n "$BIN" ]; then
-            SIZE=$(stat -c%s "$BIN")
-            echo "Binary size: ${SIZE} bytes ($(( SIZE / 1024 )) KB)"
-          fi
+          echo "==============================="
+          echo " Firmware build summary"
+          echo "==============================="
+          for f in \
+            build/merged-firmware.bin \
+            build/spiffs.bin \
+            build/*.ino.bin; do
+            [ -f "$f" ] && printf "%-40s %s\n" "$f" "$(du -sh $f | cut -f1)"
+          done
+          echo ""
+          echo "Flash 刷写命令（merged-firmware，一键刷入）："
+          echo "  esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 921600 write_flash 0x0 merged-firmware.bin"
+          echo ""
+          echo "分步刷写命令："
+          APP=$(find build/ -name "*.ino.bin" ! -name "*bootloader*" ! -name "*partitions*" | head -1)
+          BOOT=$(find build/ -name "bootloader.bin" | head -1)
+          PART=$(find build/ -name "partitions.bin" | head -1)
+          BAPP=$(find build/ -name "boot_app0.bin"  | head -1)
+          echo "  esptool.py --chip esp32 --port /dev/ttyUSB0 --baud 921600 write_flash \\"
+          echo "    0x1000   $BOOT \\"
+          echo "    0x8000   $PART \\"
+          echo "    0xe000   $BAPP \\"
+          echo "    0x10000  $APP  \\"
+          echo "    0x670000 build/spiffs.bin"
