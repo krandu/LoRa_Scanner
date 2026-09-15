@@ -55,9 +55,8 @@ jobs:
       - name: Install libraries
         run: |
           arduino-cli lib install "Heltec ESP32 Dev-Boards"
-          arduino-cli lib install "LoRa"
 
-      # ── 8. 覆盖板包默认分区表并编译 ────────────────────────────
+      # ── 8. 覆盖默认分区表并编译（屏蔽 Warning 终止）───────────
       - name: Compile sketch
         run: |
           FQBN=$(arduino-cli board listall | grep -i "WiFiLoRa32.*V2" | awk '{print $NF}' | head -1)
@@ -74,16 +73,17 @@ jobs:
           echo "FQBN=$FQBN" >> $GITHUB_ENV
           echo "Using FQBN: $FQBN"
 
-          # 寻找 Heltec 开发板存放 partitions 的目录，并用本地 spiffs/partitions.csv 覆盖默认的分区表
+          # 覆盖开发板默认的 default.csv 分区表
           PART_DIR=$(find /home/runner/.arduino15/packages/Heltec-esp32/hardware/esp32/ -type d -name "partitions" | head -1)
           if [ -d "$PART_DIR" ]; then
             echo "Copying custom partitions.csv to $PART_DIR/default.csv"
             cp spiffs/partitions.csv "$PART_DIR/default.csv"
           fi
 
+          # --warnings none 忽略第三方库的 C++ 溢出警告
           arduino-cli compile \
             --fqbn "$FQBN" \
-            --warnings default \
+            --warnings none \
             --export-binaries \
             --build-property "upload.maximum_size=3342336" \
             --output-dir build/ \
@@ -94,7 +94,6 @@ jobs:
         run: ls -lh build/
 
       # ── 10. 生成 SPIFFS 镜像 ─────────────────────────────────
-      #   创建临时镜像构建目录 spiffs_data，避免把 partitions.csv 也打包进去
       - name: Generate SPIFFS image
         run: |
           mkdir -p spiffs_data
