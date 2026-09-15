@@ -4,18 +4,17 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
-// ================= 硬件引脚与电源配置 =================
+// ================= 硬件引脚配置 =================
 #define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 64
 
-#define VEXT_CTRL_PIN 21 // Heltec OLED 供电控制 (LOW = 开启)
+#define VEXT_CTRL_PIN 21 
 #define OLED_SDA      4
 #define OLED_SCL      15
 #define OLED_RST      16 
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 
-// LoRa 引脚 (Heltec WiFi LoRa 32 V2)
 #define SCK_PIN   5
 #define MISO_PIN  19
 #define MOSI_PIN  27
@@ -25,40 +24,37 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 
 #define PRG_BUTTON_PIN 0 
 
-// ================= 运行模式定义 =================
+// ================= 模式与状态 =================
 enum SystemMode { MODE_SPECTRUM, MODE_LORA_ANALYZER };
-SystemMode currentMode = MODE_SPECTRUM; // 默认启动为频谱分析模式
+SystemMode currentMode = MODE_SPECTRUM; 
 
-// ================= 频谱扫描配置 (430MHz - 440MHz) =================
 #define SPEC_START_FREQ  430.0
 #define SPEC_END_FREQ    440.0
-#define SPEC_CHANNELS    40     // 40 个通道 (步长 250kHz)
+#define SPEC_CHANNELS    40     
 
-// 频谱图区域布局（加边框后内部显示宽度为 120px）
 #define SPEC_BOX_X       3
 #define SPEC_BOX_Y       11
 #define SPEC_BOX_W       122
 #define SPEC_BOX_H       18
 
-// 瀑布图区域布局（加边框）
 #define WATERFALL_X      3
 #define WATERFALL_Y      32
 #define WATERFALL_W      122
 #define WATERFALL_H      20
 
 float specRssi[SPEC_CHANNELS];
-uint8_t waterfallBuf[WATERFALL_H - 2][SPEC_CHANNELS]; // 内部显示历史数据缓存
+uint8_t waterfallBuf[WATERFALL_H - 2][SPEC_CHANNELS]; 
 
 float peakRssiFreq = 430.0;
-float maxFoundRssi = -120.0;
-float minFoundRssi = -120.0; // 全频段最低底噪基准
+float maxFoundRssi = -160.0;
+float minFoundRssi = 0.0; 
 
-// ================= LoRa 模式配置与缓冲区 =================
+// LoRa 分析模式变量
 const float FREQ_LIST[] = { 438.150, 438.125, 438.000, 438.500 }; 
 const int FREQ_COUNT = sizeof(FREQ_LIST) / sizeof(FREQ_LIST[0]);
 int freqIdx = 0;
 float currentFreq = FREQ_LIST[0];
-long signalBandwidth = 125E3; // 125kHz
+long signalBandwidth = 125E3; 
 
 struct LoRaCombo { uint8_t sf; uint8_t cr; };
 const LoRaCombo COMBO_LIST[] = {
@@ -82,19 +78,19 @@ String decodedPayload = "";
 int lastPacketRssi = 0;
 float lastPacketSnr = 0.0;
 
-// ================= 按键状态机 =================
+// 按键与菜单
 enum BtnEvent { NONE, SINGLE_CLICK, DOUBLE_CLICK, LONG_PRESS };
 unsigned long btnPressTime = 0;
 unsigned long lastReleaseTime = 0;
 bool lastBtnState = HIGH;
 bool isWaitingForClick = false;
 
-// ================= 菜单系统 =================
 bool inMenu = false;
 int menuSelection = 0; 
-const int MENU_ITEMS = 2; // 0: 频谱分析, 1: LoRa 模式
+const int MENU_ITEMS = 2; 
 
-// ================= 函数声明 =================
+unsigned long lastLogMs = 0; // Log 打印控制
+
 void applyLoRaConfig();
 void runSpectrumScan();
 void sampleRSSI();
@@ -102,29 +98,30 @@ void drawMainDisplay();
 void drawSpectrumDisplay();
 void drawMenuDisplay();
 BtnEvent checkButton();
-void enterDeepSleep();
 
 void setup() {
   Serial.begin(115200);
+  delay(500);
+  Serial.println("\n--- Heltec WiFi LoRa 32 V2 Diagnostic Mode ---");
+
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
-  // 1. 开启外设电源 VEXT
   pinMode(VEXT_CTRL_PIN, OUTPUT);
   digitalWrite(VEXT_CTRL_PIN, LOW); 
   delay(50);
 
-  // 2. 复位 OLED 硬件
   pinMode(OLED_RST, OUTPUT);
   digitalWrite(OLED_RST, LOW);
   delay(20);
   digitalWrite(OLED_RST, HIGH);
 
-  // 3. 初始化 I2C 与 OLED
   Wire.begin(OLED_SDA, OLED_SCL);
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 allocation failed"));
+    Serial.println("[ERR] SSD1306 OLED init failed!");
     for(;;);
   }
+  Serial.println("[OK] OLED Display initialized.");
+
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
   display.setTextSize(1);
@@ -132,58 +129,54 @@ void setup() {
   display.println(F("Initializing..."));
   display.display();
 
-  // 4. 初始化 SPI & LoRa
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
 
   if (!LoRa.begin(currentFreq * 1E6)) {
-    Serial.println("LoRa Init Failed!");
+    Serial.println("[ERR] LoRa Chip (SX1276) Init Failed! Check connections.");
     display.clearDisplay();
     display.setCursor(20, 25);
     display.println(F("LoRa Init Failed!"));
     display.display();
     while (1);
   }
+  
+  // 切换为连续接收模式以能够读取 RSSI
+  LoRa.receive();
+  Serial.println("[OK] SX1276 LoRa transceiver started successfully.");
 
   for (int i = 0; i < RSSI_HIST_LEN; i++) rssiHistory[i] = -120.0;
   memset(waterfallBuf, 0, sizeof(waterfallBuf));
-
-  if (currentMode == MODE_LORA_ANALYZER) {
-    applyLoRaConfig();
-  }
 }
 
 void loop() {
   BtnEvent evt = checkButton();
 
-  // 双击：唤出模式切换菜单
   if (evt == DOUBLE_CLICK) {
     inMenu = !inMenu;
     if (inMenu) menuSelection = (currentMode == MODE_SPECTRUM) ? 0 : 1;
+    Serial.printf("[BTN] Double click! inMenu=%d\n", inMenu);
   }
 
   if (inMenu) {
-    // ---- 模式切换菜单模式 ----
     if (evt == SINGLE_CLICK) {
       menuSelection = (menuSelection + 1) % MENU_ITEMS;
     } else if (evt == LONG_PRESS) {
-      if (menuSelection == 0) {
-        currentMode = MODE_SPECTRUM;
-      } else if (menuSelection == 1) {
+      if (menuSelection == 0) currentMode = MODE_SPECTRUM;
+      else if (menuSelection == 1) {
         currentMode = MODE_LORA_ANALYZER;
         applyLoRaConfig();
       }
-      inMenu = false; // 切换并退出菜单
+      inMenu = false;
+      Serial.printf("[MENU] Selected Mode: %d\n", currentMode);
     }
     drawMenuDisplay();
   } 
   else if (currentMode == MODE_SPECTRUM) {
-    // ---- 频谱分析模式 ----
     runSpectrumScan();
     drawSpectrumDisplay();
   } 
   else {
-    // ---- LoRa 接收分析模式 ----
     if (isLocked) {
       if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
         isLocked = false;
@@ -216,13 +209,14 @@ void loop() {
 
       lastPacketRssi = LoRa.packetRssi();
       lastPacketSnr = LoRa.packetSnr();
+      Serial.printf("[LORA RX] Packet: %s | RSSI:%d SNR:%.1f\n", decodedPayload.c_str(), lastPacketRssi, lastPacketSnr);
     }
 
     drawMainDisplay();
   }
 }
 
-// 快速全频段 RSSI 扫描（计算最小底噪基准）
+// 执行频谱扫描并打印调试日志
 void runSpectrumScan() {
   float step = (SPEC_END_FREQ - SPEC_START_FREQ) / SPEC_CHANNELS;
   maxFoundRssi = -160.0;
@@ -231,10 +225,17 @@ void runSpectrumScan() {
   for (int i = 0; i < SPEC_CHANNELS; i++) {
     float freq = SPEC_START_FREQ + i * step;
     LoRa.setFrequency(freq * 1E6);
-    delayMicroseconds(2500); // 频点切换建立延时
+    LoRa.receive(); // 切换回接收态以获取 RSSI
+    delayMicroseconds(2500); 
     
+    // 读取当前频点的 RSSI
     float val = LoRa.packetRssi();
-    if (val == 0) val = -120.0;
+    
+    // 如果读取到的 packetRssi 为 0，说明未获取到有效环境 RSSI，尝试从底层寄存器读取
+    if (val == 0 || val == -120.0) {
+      val = -137.0 + LoRa.readRegister(0x0F); // 0x0F 为 RegRssiValue (SX1276)
+    }
+    
     specRssi[i] = val;
 
     if (val > maxFoundRssi) {
@@ -246,10 +247,20 @@ void runSpectrumScan() {
     }
   }
 
-  // 保护边界：防止极端情况下的底噪过于接近顶格
-  if (minFoundRssi > -60.0) minFoundRssi = -120.0;
+  // 1 秒输出一次串口 Log
+  if (millis() - lastLogMs > 1000) {
+    lastLogMs = millis();
+    Serial.println("\n====== SPECTRUM SCAN DIAGNOSTIC LOG ======");
+    Serial.printf("Min RSSI (Noise Floor): %.1f dBm\n", minFoundRssi);
+    Serial.printf("Max RSSI (Peak Signal): %.1f dBm @ %.3f MHz\n", maxFoundRssi, peakRssiFreq);
+    Serial.print("Sample RSSI [Ch0..Ch9]: ");
+    for(int k=0; k<10; k++) {
+      Serial.printf("%.0f ", specRssi[k]);
+    }
+    Serial.println("\n===========================================");
+  }
 
-  // 瀑布图向下平移更新（在框内部区域流动）
+  // 瀑布图向下平移更新
   int wfLines = WATERFALL_H - 2;
   for (int y = wfLines - 1; y > 0; y--) {
     for (int x = 0; x < SPEC_CHANNELS; x++) {
@@ -257,21 +268,18 @@ void runSpectrumScan() {
     }
   }
 
-  // 基于最低底噪 minFoundRssi 动态计算瀑布图强度划分：
-  // 0: 底噪/极弱信号  1: 中等信号 (高于底噪 12dB)  2: 强信号 (高于底噪 30dB)
+  // 基于实际算出的底噪动态阶梯划分
   for (int x = 0; x < SPEC_CHANNELS; x++) {
     float delta = specRssi[x] - minFoundRssi;
-    if (delta > 30.0)      waterfallBuf[0][x] = 2;
-    else if (delta > 12.0) waterfallBuf[0][x] = 1;
-    else                   waterfallBuf[0][x] = 0;
+    if (delta > 20.0)      waterfallBuf[0][x] = 2; // 强
+    else if (delta > 8.0)  waterfallBuf[0][x] = 1; // 中
+    else                   waterfallBuf[0][x] = 0; // 弱/底噪
   }
 }
 
-// 绘制带有专属边框的频谱图与瀑布图
 void drawSpectrumDisplay() {
   display.clearDisplay();
 
-  // 1. 顶部状态栏: 显示范围与峰值频点
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print("430-440M");
@@ -282,28 +290,26 @@ void drawSpectrumDisplay() {
   display.setCursor(peakX, 0);
   display.print(peakBuf);
 
-  // 2. 绘制频谱图边框
+  // 1. 频谱图边框
   display.drawRect(SPEC_BOX_X, SPEC_BOX_Y, SPEC_BOX_W, SPEC_BOX_H, SSD1306_WHITE);
 
-  // 频谱柱状图内容（绘制在框内）
   int innerX = SPEC_BOX_X + 1;
   int innerY = SPEC_BOX_Y + 1;
   int innerH = SPEC_BOX_H - 2;
-  int colWidth = (SPEC_BOX_W - 2) / SPEC_CHANNELS; // 每通道 3px 宽
+  int colWidth = (SPEC_BOX_W - 2) / SPEC_CHANNELS; 
 
   for (int i = 0; i < SPEC_CHANNELS; i++) {
-    // 以当前扫描到的最低底噪 minFoundRssi 为 X 轴基准起点
-    int lineH = map((int)constrain(specRssi[i], minFoundRssi, -30.0), (int)minFoundRssi, -30, 0, innerH);
+    // 根据底噪 minFoundRssi 到最高可承载的 -30dBm 映射
+    int lineH = map((int)constrain(specRssi[i], minFoundRssi, -30.0), (int)minFoundRssi, -30, 1, innerH);
     int xPos = innerX + i * colWidth;
     if (lineH > 0) {
       display.fillRect(xPos, innerY + innerH - lineH, colWidth - 1, lineH, SSD1306_WHITE);
     }
   }
 
-  // 3. 绘制瀑布图边框
+  // 2. 瀑布图边框
   display.drawRect(WATERFALL_X, WATERFALL_Y, WATERFALL_W, WATERFALL_H, SSD1306_WHITE);
 
-  // 瀑布图内容（绘制在框内）
   int wfInnerX = WATERFALL_X + 1;
   int wfInnerY = WATERFALL_Y + 1;
   int wfLines = WATERFALL_H - 2;
@@ -314,10 +320,8 @@ void drawSpectrumDisplay() {
       uint8_t val = waterfallBuf[y][i];
 
       if (val == 2) {
-        // 强信号：点亮块
         display.fillRect(xPos, wfInnerY + y, colWidth - 1, 1, SSD1306_WHITE);
       } else if (val == 1) {
-        // 中等信号：抖动点阵
         if ((i + y) % 2 == 0) {
           display.drawPixel(xPos, wfInnerY + y, SSD1306_WHITE);
         }
@@ -325,11 +329,11 @@ void drawSpectrumDisplay() {
     }
   }
 
-  // 4. 底部扫描信息栏：STEP 在右下角左对齐布局
+  // 3. 底部状态栏 (STEP 在右下角左对齐)
   display.setCursor(0, 56);
   display.print("SPAN:10M");
 
-  display.setCursor(72, 56); // 右下角起始 XPos 对齐，呈现左对齐效果
+  display.setCursor(72, 56); 
   display.print("STEP:250K");
 
   display.display();
@@ -345,7 +349,7 @@ void applyLoRaConfig() {
 
 void sampleRSSI() {
   float rawRssi = LoRa.packetRssi(); 
-  if (rawRssi == 0) rawRssi = -120;
+  if (rawRssi == 0) rawRssi = -137.0 + LoRa.readRegister(0x0F);
   rssiHistory[rssiWrIdx] = rawRssi;
   rssiWrIdx = (rssiWrIdx + 1) % RSSI_HIST_LEN;
 }
@@ -353,7 +357,6 @@ void sampleRSSI() {
 void drawMainDisplay() {
   display.clearDisplay();
 
-  // 1. 顶部状态栏
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.printf("%.3fMHz", currentFreq);
@@ -369,10 +372,8 @@ void drawMainDisplay() {
   display.setCursor(rightTopX, 0);
   display.print(rightTopBuf);
 
-  // 2. 边框外壳
   display.drawRect(BOX_X - 1, BOX_Y - 1, BOX_W + 2, BOX_H + 2, SSD1306_WHITE);
 
-  // 3. 方框区内容
   if (isLocked) {
     display.setTextSize(1);
     display.setTextWrap(false);
@@ -414,7 +415,6 @@ void drawMainDisplay() {
     }
   }
 
-  // 4. 底部状态栏
   int bottomY = 52;
   display.setTextSize(1);
   display.setCursor(0, bottomY);
@@ -429,7 +429,6 @@ void drawMainDisplay() {
   display.display();
 }
 
-// 绘制模式选择菜单
 void drawMenuDisplay() {
   display.clearDisplay();
   
