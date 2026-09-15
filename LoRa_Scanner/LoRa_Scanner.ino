@@ -22,6 +22,9 @@
  */
 
 #include "heltec.h"
+#include <SPI.h>
+#include <LoRa.h>
+#include "SSD1306Wire.h"  // 或 #include <heltec.h>
 
 // ============================================================
 //  可调参数
