@@ -41,11 +41,12 @@ jobs:
           arduino-cli config add board_manager.additional_urls \
             https://resource.heltec.cn/download/package_heltec_esp32_index.json
 
-      # ── 5. 更新索引 & 安装核心 ───────────────────────────────
+      # ── 5. 更新索引 & 安装兼容核心 ───────────────────────────
       - name: Update index and install core
         run: |
           arduino-cli core update-index
-          arduino-cli core install Heltec-esp32:esp32
+          # 锁定 Heltec-esp32 核心包版本为 0.0.8，避免 3.x 版本的底层 SPI API 变动
+          arduino-cli core install Heltec-esp32:esp32@0.0.8
 
       # ── 6. 列出已安装板子（确认 FQBN）───────────────────────
       - name: List installed boards
@@ -73,8 +74,8 @@ jobs:
           echo "FQBN=$FQBN" >> $GITHUB_ENV
           echo "Using FQBN: $FQBN"
 
-          # 覆盖开发板默认的 default.csv 分区表
-          PART_DIR=$(find /home/runner/.arduino15/packages/Heltec-esp32/hardware/esp32/ -type d -name "partitions" | head -1)
+          # 覆盖开发板默认的分区表
+          PART_DIR=$(find /home/runner/.arduino15/packages/Heltec-esp32/ -type d -name "partitions" | head -1)
           if [ -d "$PART_DIR" ]; then
             echo "Copying custom partitions.csv to $PART_DIR/default.csv"
             cp spiffs/partitions.csv "$PART_DIR/default.csv"
