@@ -51,7 +51,8 @@ jobs:
       - name: Install libraries
         run: |
           arduino-cli lib install "LoRa"
-          arduino-cli lib install "ESP8266 and ESP32 OLED driver for SSD1306 displays"
+          arduino-cli lib install "Adafruit GFX Library"
+          arduino-cli lib install "Adafruit SSD1306"
 
       # ── 7. 编译项目 ──────────────────────────────────────────
       - name: Compile sketch
