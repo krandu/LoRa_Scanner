@@ -2,6 +2,21 @@
  * ============================================================
  *  LoRa Scanner / Decoder  —  Heltec WiFi LoRa 32 V2
  * ============================================================
+ *
+ *  基于 OpenWebRX 瀑布图观测结果优化：
+ *    · 目标信号为 LoRa / Meshtastic（125 kHz 实心矩形块）
+ *    · 频段：435~436 MHz（弱），438.125 MHz（强）
+ *    · 优先扫描 SF11/SF12
+ *    · Meshtastic 同步字 0x2B
+ *
+ *  硬件管脚映射 (WiFi LoRa 32 V2):
+ *    · VEXT 电源控制 : GPIO 21 (低电平供电)
+ *    · OLED SDA      : GPIO 4
+ *    · OLED SCL      : GPIO 15
+ *    · OLED RST      : GPIO 16
+ *    · LoRa CS/RST/D0: GPIO 18, 14, 26
+ *    · PRG 按键      : GPIO 0
+ * ============================================================
  */
 
 #include <SPI.h>
@@ -12,9 +27,10 @@
 // ============================================================
 //  硬件引脚定义 (Heltec WiFi LoRa 32 V2)
 // ============================================================
-#define OLED_RST  16
-#define OLED_SDA  21
-#define OLED_SCL  22
+#define VEXT_PIN  21  // 外部 3.3V 供电开关 (低电平开启)
+#define OLED_RST  16  // OLED 硬件复位引脚
+#define OLED_SDA   4  // 独立 I2C SDA 引脚
+#define OLED_SCL  15  // 独立 I2C SCL 引脚
 
 #define LORA_SCK   5
 #define LORA_MISO 19
@@ -23,9 +39,9 @@
 #define LORA_RST  14
 #define LORA_DIO0 26
 
-#define BTN_PIN    0
+#define BTN_PIN    0  // 板载 PRG 按键
 
-// OLED 实例 (0x3c, SDA=21, SCL=22)
+// SSD1306Wire 屏幕实例 (I2C 地址 0x3C)
 SSD1306Wire display(0x3c, OLED_SDA, OLED_SCL, GEOMETRY_128_64);
 
 // ============================================================
@@ -68,7 +84,7 @@ static const long BW = 125000L;
 // ============================================================
 //  全局状态
 // ============================================================
-static int  freqIdx    = 3;
+static int  freqIdx    = 3; // 默认 438.125 MHz
 static int  comboIdx   = 0;
 static bool locked     = false;
 
@@ -89,6 +105,35 @@ static bool          btnHeld     = false;
 
 inline int curSF() { return COMBO_LIST[comboIdx].sf; }
 inline int curCR() { return COMBO_LIST[comboIdx].cr; }
+
+// ============================================================
+//  OLED 供电与硬件初始化
+// ============================================================
+void initOLED() {
+  // 1. 开启 Vext 供电 (低电平开启 3.3V)
+  pinMode(VEXT_PIN, OUTPUT);
+  digitalWrite(VEXT_PIN, LOW);
+  delay(100);
+
+  // 2. 硬件复位 OLED
+  pinMode(OLED_RST, OUTPUT);
+  digitalWrite(OLED_RST, LOW);
+  delay(50);
+  digitalWrite(OLED_RST, HIGH);
+  delay(50);
+
+  // 3. 初始化 Wire 总线与屏幕
+  Wire.begin(OLED_SDA, OLED_SCL);
+  display.init();
+  display.flipScreenVertically();
+  display.clear();
+  display.setFont(ArialMT_Plain_10);
+  display.drawString(0,  0, "LoRa Scanner v2");
+  display.drawString(0, 14, "Heltec WiFi LoRa 32 V2");
+  display.drawString(0, 28, "Target: Meshtastic");
+  display.drawString(0, 42, "Sync: 0x2B  BW: 125k");
+  display.display();
+}
 
 // ============================================================
 //  LoRa 配置下发
@@ -144,18 +189,20 @@ void sampleRSSI() {
 }
 
 // ============================================================
-//  OLED 绘制
+//  OLED 界面绘制
 // ============================================================
 void drawDisplay() {
   display.clear();
   display.setFont(ArialMT_Plain_10);
 
+  // 第一行：当前频率与参数
   char buf[32];
   snprintf(buf, sizeof(buf), "%.3fM", FREQ_LIST[freqIdx] / 1e6);
   display.drawString(0, 0, buf);
   snprintf(buf, sizeof(buf), "SF%d CR4/%d", curSF(), curCR());
   display.drawString(75, 0, buf);
 
+  // 第二行：锁定与扫描状态
   if (locked) {
     snprintf(buf, sizeof(buf), "*LOCK* R:%d S:%d", lastRSSI, lastSNR);
   } else {
@@ -163,6 +210,7 @@ void drawDisplay() {
   }
   display.drawString(0, 10, buf);
 
+  // 瀑布图绘制
   for (int col = 0; col < WF_W; col++) {
     int idx  = (rssiWrIdx + col) % WF_W;
     int h    = (int)map((long)rssiHistory[idx], RSSI_MIN, RSSI_MAX, 0, WF_H);
@@ -172,6 +220,7 @@ void drawDisplay() {
     }
   }
 
+  // 锁定时底部显示数据帧预览
   if (locked && lastPayload.length() > 0) {
     String preview = ">" + lastPayload.substring(0, 18);
     display.drawString(0, 54, preview);
@@ -180,6 +229,9 @@ void drawDisplay() {
   display.display();
 }
 
+// ============================================================
+//  按键逻辑处理
+// ============================================================
 void handleButton() {
   bool pressed = (digitalRead(BTN_PIN) == LOW);
 
@@ -195,6 +247,7 @@ void handleButton() {
     if (dur < DEBOUNCE_MS) return;
 
     if (dur >= LONG_PRESS_MS) {
+      // 长按：切换频率
       freqIdx    = (freqIdx + 1) % FREQ_COUNT;
       comboIdx   = 0;
       locked     = false;
@@ -202,6 +255,7 @@ void handleButton() {
       applyLoRaConfig();
       Serial.printf("[BTN] 长按 → %.3f MHz\n", FREQ_LIST[freqIdx] / 1e6);
     } else {
+      // 短按：切换 SF/CR 组合或手动解锁
       locked     = false;
       lastPayload = "";
       comboIdx   = (comboIdx + 1) % COMBO_COUNT;
@@ -227,26 +281,12 @@ void autoScan() {
 void setup() {
   Serial.begin(115200);
 
-  // 初始化 OLED 复位引脚
-  pinMode(OLED_RST, OUTPUT);
-  digitalWrite(OLED_RST, LOW);
-  delay(50);
-  digitalWrite(OLED_RST, HIGH);
-
-  // 初始化 OLED 屏幕
-  display.init();
-  display.flipScreenVertically();
-  display.clear();
-  display.setFont(ArialMT_Plain_10);
-  display.drawString(0,  0, "LoRa Scanner v2");
-  display.drawString(0, 14, "Heltec WiFi LoRa 32 V2");
-  display.drawString(0, 28, "Target: Meshtastic");
-  display.drawString(0, 42, "Sync: 0x2B  BW: 125k");
-  display.display();
+  // 初始化 OLED (含 Vext 供电和复位)
+  initOLED();
 
   pinMode(BTN_PIN, INPUT_PULLUP);
 
-  // 初始化 SPI & LoRa 引脚
+  // 初始化 SPI 与 LoRa 模块
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
 
