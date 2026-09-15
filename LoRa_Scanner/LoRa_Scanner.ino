@@ -182,7 +182,7 @@ void onReceive(int packetSize) {
 //  RSSI 采样 → 瀑布图缓冲
 // ============================================================
 void sampleRSSI() {
-  rssiHistory[rssiWrIdx] = LoRa.rssi();
+  rssiHistory[rssiWrIdx] = LoRa.packetRssi();
   rssiWrIdx = (rssiWrIdx + 1) % WF_W;
 }
 
