@@ -34,8 +34,21 @@ unsigned long lastActivityMs = 0;
 enum SystemMode { MODE_SPECTRUM, MODE_LORA_ANALYZER };
 SystemMode currentMode = MODE_SPECTRUM; 
 
-#define SPEC_START_FREQ  430.0
-#define SPEC_END_FREQ    440.0
+// 优化：增加分段 Span/步进 结构
+struct SpectrumSpanOption {
+  float spanMHz;
+  float stepkHz;
+};
+SpectrumSpanOption spanOptions[] = {
+  {10.0, 250.0}, // 全景扫描
+  {5.0,  125.0}, // 中等细化
+  {2.0,  50.0}   // 高精窄带细化 (可以清晰看清窄带LoRa/手台信号)
+};
+const int SPAN_COUNT = sizeof(spanOptions) / sizeof(spanOptions[0]);
+int spanIdx = 0;
+
+float specStartFreq = 430.0;
+float specEndFreq   = 440.0;
 #define SPEC_CHANNELS    40     
 
 #define SPEC_BOX_X       3
@@ -57,6 +70,12 @@ float rawPeakFreq = 430.0;
 float displayedPeakFreq = 430.0;
 float displayedPeakRssi = -160.0;
 unsigned long lastPeakUpdateMs = 0;
+
+// 新增：底噪平滑与保持变量
+float smoothedNoiseFloor = -100.0;
+float displayedNoiseFloor = -100.0;
+unsigned long lastNoiseUpdateMs = 0;
+const unsigned long NOISE_HOLD_TIME_MS = 1500; // 1.5秒刷新一次底噪数字
 
 float maxFoundRssi = -160.0;
 float minFoundRssi = 0.0; 
@@ -90,6 +109,10 @@ String decodedPayload = "";
 int lastPacketRssi = 0;
 float lastPacketSnr = 0.0;
 
+// 电池滤波平滑变量
+float smoothedVbat = 0.0;
+int displayedBatPct = -1;
+
 // 按键与菜单
 enum BtnEvent { NONE, SINGLE_CLICK, DOUBLE_CLICK, LONG_PRESS };
 unsigned long btnPressTime = 0;
@@ -112,11 +135,12 @@ BtnEvent checkButton();
 float readBatteryVoltage();
 int getBatteryPercent(float vbat);
 void powerOff();
+void updateSpanFreqs();
 
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n--- Heltec WiFi LoRa 32 V2 Enhanced ---");
+  Serial.println("\n--- Heltec WiFi LoRa 32 V2 Spectrum Fixed ---");
 
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
@@ -151,6 +175,8 @@ void setup() {
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
 
+  updateSpanFreqs();
+
   if (!LoRa.begin(currentFreq * 1E6)) {
     Serial.println("[ERR] LoRa Chip Init Failed!");
     display.clearDisplay();
@@ -167,17 +193,23 @@ void setup() {
   lastActivityMs = millis();
 }
 
+void updateSpanFreqs() {
+  float currentCenter = 435.0; // 中心频点设定在 435 MHz
+  float halfSpan = spanOptions[spanIdx].spanMHz / 2.0;
+  specStartFreq = currentCenter - halfSpan;
+  specEndFreq   = currentCenter + halfSpan;
+}
+
 void loop() {
-  // 1. 检查 10 分钟自动关机
+  // 1. 自动关机检测
   if (millis() - lastActivityMs > AUTO_POWER_OFF_MS) {
-    Serial.println("[SYSTEM] Auto power off due to inactivity.");
     powerOff();
   }
 
   // 2. 检测按键事件
   BtnEvent evt = checkButton();
   if (evt != NONE) {
-    lastActivityMs = millis(); // 刷新用户活动时间
+    lastActivityMs = millis();
   }
 
   if (evt == DOUBLE_CLICK) {
@@ -185,7 +217,7 @@ void loop() {
     if (inMenu) menuSelection = (currentMode == MODE_SPECTRUM) ? 0 : 1;
   }
 
-  // 3. 菜单逻辑控制
+  // 3. 菜单控制
   if (inMenu) {
     if (evt == SINGLE_CLICK) {
       menuSelection = (menuSelection + 1) % MENU_ITEMS;
@@ -196,18 +228,27 @@ void loop() {
         currentMode = MODE_LORA_ANALYZER;
         applyLoRaConfig();
       } else if (menuSelection == 2) {
-        powerOff(); // 确认关机
+        powerOff();
       }
       inMenu = false;
     }
     drawMenuDisplay();
   } 
-  // 4. 频谱模式
+  // 4. 频谱扫描模式 (支持按键切换 Span)
   else if (currentMode == MODE_SPECTRUM) {
+    if (evt == SINGLE_CLICK) {
+      // 单击：切换 Span (10M -> 5M -> 2M 细化扫描)
+      spanIdx = (spanIdx + 1) % SPAN_COUNT;
+      updateSpanFreqs();
+    } else if (evt == LONG_PRESS) {
+      // 长按：复位 Peak 清屏
+      displayedPeakRssi = -160.0;
+    }
+
     runSpectrumScan();
     drawSpectrumDisplay();
   } 
-  // 5. LoRa 接收与分析模式
+  // 5. LoRa 分析模式
   else {
     if (isLocked) {
       if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
@@ -247,20 +288,22 @@ void loop() {
   }
 }
 
-// 频谱扫描与防抖机制
+// 频谱扫描与底噪/峰值算法
 void runSpectrumScan() {
-  float step = (SPEC_END_FREQ - SPEC_START_FREQ) / SPEC_CHANNELS;
+  float step = (specEndFreq - specStartFreq) / SPEC_CHANNELS;
   maxFoundRssi = -160.0;
   minFoundRssi = 0.0;
+  float rssiSum = 0.0;
 
   for (int i = 0; i < SPEC_CHANNELS; i++) {
-    float freq = SPEC_START_FREQ + i * step;
+    float freq = specStartFreq + i * step;
     LoRa.setFrequency(freq * 1E6);
     LoRa.receive(); 
-    delayMicroseconds(2500); 
+    delayMicroseconds(1800); 
     
     float val = LoRa.rssi();
     specRssi[i] = val;
+    rssiSum += val;
 
     if (val > maxFoundRssi) {
       maxFoundRssi = val;
@@ -271,14 +314,23 @@ void runSpectrumScan() {
     }
   }
 
-  // 峰值防抖算法：新峰值高于原峰值 3.0 dBm 或保持超 1.5 秒后更新
+  // 1. 底噪平滑与保持算法
+  float instantAvgNoise = rssiSum / SPEC_CHANNELS;
+  smoothedNoiseFloor = (smoothedNoiseFloor * 0.85) + (instantAvgNoise * 0.15); // 一阶低通滤波
+  
+  if (millis() - lastNoiseUpdateMs > NOISE_HOLD_TIME_MS) {
+    displayedNoiseFloor = smoothedNoiseFloor;
+    lastNoiseUpdateMs = millis();
+  }
+
+  // 2. 峰值防抖算法
   if ((maxFoundRssi > displayedPeakRssi + 3.0) || (millis() - lastPeakUpdateMs > 1500)) {
     displayedPeakFreq = rawPeakFreq;
     displayedPeakRssi = maxFoundRssi;
     lastPeakUpdateMs = millis();
   }
 
-  // 瀑布图更新
+  // 3. 瀑布图更新
   int wfLines = WATERFALL_H - 2;
   for (int y = wfLines - 1; y > 0; y--) {
     for (int x = 0; x < SPEC_CHANNELS; x++) {
@@ -296,18 +348,16 @@ void runSpectrumScan() {
 
 void drawSpectrumDisplay() {
   display.clearDisplay();
-
   display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print("430-440M");
-  
-  // 显示防抖后的峰值频率
-  char peakBuf[16];
-  snprintf(peakBuf, sizeof(peakBuf), "P:%.2f", displayedPeakFreq);
-  display.setCursor(52, 0);
-  display.print(peakBuf);
+  display.setTextColor(SSD1306_WHITE);
 
-  // 显示右对齐电量百分比
+  // 顶栏：显示频率与峰值
+  char topBuf[16];
+  snprintf(topBuf, sizeof(topBuf), "P:%.2f", displayedPeakFreq);
+  display.setCursor(0, 0);
+  display.print(topBuf);
+
+  // 顶栏右侧：平滑后防抖的电池百分比
   float vbat = readBatteryVoltage();
   int pct = getBatteryPercent(vbat);
   char batStr[8];
@@ -316,7 +366,7 @@ void drawSpectrumDisplay() {
   display.setCursor(batX, 0);
   display.print(batStr);
 
-  // 1. 频谱柱状图
+  // 1. 绘制频谱柱状图边框
   display.drawRect(SPEC_BOX_X, SPEC_BOX_Y, SPEC_BOX_W, SPEC_BOX_H, SSD1306_WHITE);
   int innerX = SPEC_BOX_X + 1;
   int innerY = SPEC_BOX_Y + 1;
@@ -331,7 +381,18 @@ void drawSpectrumDisplay() {
     }
   }
 
-  // 2. 瀑布图
+  // 嵌入：在频谱框内部右上角绘制背景遮罩层与保持后的底噪平均值 (NF: -XXdBm)
+  char noiseBuf[12];
+  snprintf(noiseBuf, sizeof(noiseBuf), "NF:%.0f", displayedNoiseFloor);
+  int noiseTextW = strlen(noiseBuf) * 6;
+  int noiseBoxX = (SPEC_BOX_X + SPEC_BOX_W) - noiseTextW - 3;
+  
+  // 黑色反空遮罩，防止背景频谱线与文字重叠
+  display.fillRect(noiseBoxX - 1, SPEC_BOX_Y + 2, noiseTextW + 2, 9, SSD1306_BLACK);
+  display.setCursor(noiseBoxX, SPEC_BOX_Y + 3);
+  display.print(noiseBuf);
+
+  // 2. 瀑布图绘制
   display.drawRect(WATERFALL_X, WATERFALL_Y, WATERFALL_W, WATERFALL_H, SSD1306_WHITE);
   int wfInnerX = WATERFALL_X + 1;
   int wfInnerY = WATERFALL_Y + 1;
@@ -351,11 +412,12 @@ void drawSpectrumDisplay() {
     }
   }
 
-  // 3. 底部状态栏
+  // 3. 底栏：动态显示 Span 和计算后的 Step 细化步进
   display.setCursor(0, 56);
-  display.print("SPAN:10M");
-  display.setCursor(72, 56); 
-  display.print("STEP:250K");
+  display.printf("SPAN:%.0fM", spanOptions[spanIdx].spanMHz);
+  
+  display.setCursor(70, 56); 
+  display.printf("STEP:%.0fK", spanOptions[spanIdx].stepkHz);
 
   display.display();
 }
@@ -376,12 +438,12 @@ void sampleRSSI() {
 
 void drawMainDisplay() {
   display.clearDisplay();
-
   display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
   display.setCursor(0, 0);
   display.printf("%.3fM", currentFreq);
   
-  // 显示右对齐电量百分比
   float vbat = readBatteryVoltage();
   int pct = getBatteryPercent(vbat);
   char batStr[8];
@@ -393,7 +455,6 @@ void drawMainDisplay() {
   display.drawRect(BOX_X - 1, BOX_Y - 1, BOX_W + 2, BOX_H + 2, SSD1306_WHITE);
 
   if (isLocked) {
-    display.setTextSize(1);
     display.setTextWrap(false);
     String line1 = "", line2 = "";
     if (decodedPayload.length() <= 17) {
@@ -429,7 +490,6 @@ void drawMainDisplay() {
   }
 
   int bottomY = 52;
-  display.setTextSize(1);
   display.setCursor(0, bottomY);
   display.printf("BW:%.0fK", signalBandwidth / 1000.0);
 
@@ -468,33 +528,44 @@ void drawMenuDisplay() {
   display.display();
 }
 
-// 电池电压读取 (修正控制通电与分压系数)
+// 修正： Heltec WiFi LoRa 32 V2 板载 100K/390K 分压，精准分压系数约为 4.9
 float readBatteryVoltage() {
-  // 确保 Vext (GPIO 21) 输出低电平以激活分压采样电路
   pinMode(VEXT_CTRL_PIN, OUTPUT);
   digitalWrite(VEXT_CTRL_PIN, LOW);
-  delay(2); // 等待电压稳定
+  delayMicroseconds(500);
 
-  // 读取 10 次取平均值降低采样噪声
   int rawSum = 0;
   for (int i = 0; i < 10; i++) {
     rawSum += analogRead(VBAT_ADC_PIN);
   }
   float raw = rawSum / 10.0;
   
-  // Heltec V2 采样点使用了 100K/220K 分压，对应系数约为 3.2
-  float voltage = (raw / 4095.0) * 3.3 * 3.2; 
-  return voltage;
+  // 关键校准系数：使用 4.9 替换原 3.2
+  float instantVbat = (raw / 4095.0) * 3.3 * 4.9; 
+
+  // 电压一阶平滑滤波
+  if (smoothedVbat == 0.0) smoothedVbat = instantVbat;
+  smoothedVbat = (smoothedVbat * 0.9) + (instantVbat * 0.1);
+
+  return smoothedVbat;
 }
 
+// 修正：加迟滞防抖的电池百分比算法
 int getBatteryPercent(float vbat) {
-  if (vbat >= 4.15) return 100;
-  if (vbat <= 3.30) return 0;
-  int pct = (int)((vbat - 3.30) / (4.15 - 3.30) * 100.0);
-  return constrain(pct, 0, 100);
+  int calcPct = 0;
+  if (vbat >= 4.15)      calcPct = 100;
+  else if (vbat <= 3.30) calcPct = 0;
+  else calcPct = (int)((vbat - 3.30) / (4.15 - 3.30) * 100.0);
+  
+  calcPct = constrain(calcPct, 0, 100);
+
+  // 滞后比较 (Hysteresis)：防止 39% 与 40% 频繁交替跳动
+  if (displayedBatPct == -1 || abs(calcPct - displayedBatPct) >= 2) {
+    displayedBatPct = calcPct;
+  }
+  return displayedBatPct;
 }
 
-// 深度睡眠关机
 void powerOff() {
   display.clearDisplay();
   display.setTextSize(1);
@@ -506,14 +577,10 @@ void powerOff() {
   display.clearDisplay();
   display.display();
 
-  // 关闭屏幕及外设供电
-  digitalWrite(VEXT_CTRL_PIN, HIGH); 
-  
-  // 进入深度睡眠
+  digitalWrite(VEXT_CTRL_PIN, HIGH); // 切断 VEXT 供电
   esp_deep_sleep_start();
 }
 
-// 按键事件检测
 BtnEvent checkButton() {
   bool currentState = digitalRead(PRG_BUTTON_PIN);
   unsigned long now = millis();
