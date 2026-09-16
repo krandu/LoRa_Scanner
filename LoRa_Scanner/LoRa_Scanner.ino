@@ -4,6 +4,8 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <esp_sleep.h>
+#include <esp_adc_cal.h>
+#include <Preferences.h>  // 使用 NVS 闪存存储校准系数
 
 // ================= 硬件引脚配置 =================
 #define SCREEN_WIDTH  128
@@ -16,6 +18,8 @@
 #define VBAT_ADC_PIN  37   // Heltec V2 板载电池采样引脚 (ADC1_CH1)
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
+Preferences prefs;         // NVS 存储对象
+esp_adc_cal_characteristics_t adc_chars;
 
 #define SCK_PIN   5
 #define MISO_PIN  19
@@ -25,6 +29,9 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
 #define DIO0_PIN  26
 
 #define PRG_BUTTON_PIN 0 
+
+// ================= NVS 闪存校准参数 =================
+float vbatCalFactor = 4.90f; // 默认分压校准系数
 
 // ================= 定时与休眠配置 =================
 const unsigned long AUTO_POWER_OFF_MS = 10 * 60 * 1000UL; // 10分钟无操作自动关机
@@ -48,7 +55,7 @@ const int SPAN_COUNT = sizeof(spanOptions) / sizeof(spanOptions[0]);
 int spanIdx = 0;
 
 // 中心频率与扫描范围控制
-float specCenterFreq = 435.0; // 默认中心频率 435.0 MHz
+float specCenterFreq = 435.0; 
 float specStartFreq  = 430.0;
 float specEndFreq    = 440.0;
 #define SPEC_CHANNELS    40     
@@ -77,7 +84,7 @@ unsigned long lastPeakUpdateMs = 0;
 float smoothedNoiseFloor = -100.0;
 float displayedNoiseFloor = -100.0;
 unsigned long lastNoiseUpdateMs = 0;
-const unsigned long NOISE_HOLD_TIME_MS = 1500; // 1.5秒刷新一次底噪数字
+const unsigned long NOISE_HOLD_TIME_MS = 1500; 
 
 float maxFoundRssi = -160.0;
 float minFoundRssi = 0.0; 
@@ -123,8 +130,11 @@ bool lastBtnState = HIGH;
 bool isWaitingForClick = false;
 
 bool inMenu = false;
+bool inCalibUI = false;
 int menuSelection = 0; 
-const int MENU_ITEMS = 3; 
+const int MENU_ITEMS = 4; // 1.Spectrum 2.LoRa 3.Calib Bat 4.Power Off
+
+float targetCalibVoltage = 3.80f; // 万用表测量参考电压设定值
 
 // 函数声明
 void applyLoRaConfig();
@@ -133,16 +143,20 @@ void sampleRSSI();
 void drawMainDisplay();
 void drawSpectrumDisplay();
 void drawMenuDisplay();
+void drawCalibDisplay();
 BtnEvent checkButton();
 float readBatteryVoltage();
+uint32_t readRawPinMillivolts();
 int getBatteryPercent(float vbat);
 void powerOff();
 void updateSpanFreqs();
+void saveCalibFactor(float factor);
+void loadCalibFactor();
 
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n--- Heltec WiFi LoRa 32 V2 Spectrum Fixed ---");
+  Serial.println("\n--- Heltec WiFi LoRa 32 V2 (Auto Calib) ---");
 
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
@@ -170,10 +184,14 @@ void setup() {
   display.println(F("Initializing..."));
   display.display();
 
-  // 配置 ESP32 ADC 采样 (使用 11dB 衰减)
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
+  // 配置 ESP32 ADC1 & 工厂 eFuse 校准
+  adc1_config_width(ADC_WIDTH_BIT_12);
+  adc1_config_channel_atten(ADC1_CHANNEL_1, ADC_ATTEN_DB_11);
+  esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
   pinMode(VBAT_ADC_PIN, INPUT);
+
+  // 读取 Flash 保存的校准参数
+  loadCalibFactor();
 
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
@@ -196,6 +214,23 @@ void setup() {
   lastActivityMs = millis();
 }
 
+// 加载 Flash 存储的参数
+void loadCalibFactor() {
+  prefs.begin("bat_cal", true); // 只读模式
+  vbatCalFactor = prefs.getFloat("factor", 4.90f);
+  prefs.end();
+  Serial.printf("[NVS] Loaded Calibration Factor: %.4f\n", vbatCalFactor);
+}
+
+// 保存参数到 Flash
+void saveCalibFactor(float factor) {
+  prefs.begin("bat_cal", false); // 读写模式
+  prefs.putFloat("factor", factor);
+  prefs.end();
+  vbatCalFactor = factor;
+  Serial.printf("[NVS] Saved New Calibration Factor: %.4f\n", vbatCalFactor);
+}
+
 void updateSpanFreqs() {
   float halfSpan = spanOptions[spanIdx].spanMHz / 2.0;
   specStartFreq = specCenterFreq - halfSpan;
@@ -214,35 +249,63 @@ void loop() {
     lastActivityMs = millis();
   }
 
+  // 双击随时进入/退出主菜单
   if (evt == DOUBLE_CLICK) {
-    inMenu = !inMenu;
-    if (inMenu) menuSelection = (currentMode == MODE_SPECTRUM) ? 0 : 1;
+    if (inCalibUI) {
+      inCalibUI = false;
+      inMenu = true;
+    } else {
+      inMenu = !inMenu;
+      if (inMenu) menuSelection = (currentMode == MODE_SPECTRUM) ? 0 : 1;
+    }
   }
 
-  // 3. 菜单控制
-  if (inMenu) {
+  // 3. 校准界面交互
+  if (inCalibUI) {
+    if (evt == SINGLE_CLICK) {
+      // 步进切换万用表测量值 (+0.05V，循环 3.30V ~ 4.25V)
+      targetCalibVoltage += 0.05f;
+      if (targetCalibVoltage > 4.25f) targetCalibVoltage = 3.30f;
+    } else if (evt == LONG_PRESS) {
+      // 长按保存：自动计算新系数并存盘
+      uint32_t pinmV = readRawPinMillivolts();
+      if (pinmV > 0) {
+        float newFactor = (targetCalibVoltage * 1000.0f) / (float)pinmV;
+        saveCalibFactor(newFactor);
+        smoothedVbat = 0.0f; // 重置滤波缓冲
+      }
+      inCalibUI = false;
+      inMenu = false;
+    }
+    drawCalibDisplay();
+  }
+  // 4. 菜单控制
+  else if (inMenu) {
     if (evt == SINGLE_CLICK) {
       menuSelection = (menuSelection + 1) % MENU_ITEMS;
     } else if (evt == LONG_PRESS) {
       if (menuSelection == 0) {
         currentMode = MODE_SPECTRUM;
+        inMenu = false;
       } else if (menuSelection == 1) {
         currentMode = MODE_LORA_ANALYZER;
         applyLoRaConfig();
+        inMenu = false;
       } else if (menuSelection == 2) {
+        inCalibUI = true; // 进入电池校准模式
+        targetCalibVoltage = readBatteryVoltage(); // 以当前测得电压为基准
+        if (targetCalibVoltage < 3.3f) targetCalibVoltage = 3.80f;
+      } else if (menuSelection == 3) {
         powerOff();
       }
-      inMenu = false;
     }
     drawMenuDisplay();
   } 
-  // 4. 频谱扫描模式 (短按切中心频率，长按切 Span)
+  // 5. 频谱扫描模式
   else if (currentMode == MODE_SPECTRUM) {
     if (evt == SINGLE_CLICK) {
       specCenterFreq += 1.0;
-      if (specCenterFreq > 439.0) {
-        specCenterFreq = 431.0;
-      }
+      if (specCenterFreq > 439.0) specCenterFreq = 431.0;
       updateSpanFreqs();
     } else if (evt == LONG_PRESS) {
       spanIdx = (spanIdx + 1) % SPAN_COUNT;
@@ -252,7 +315,7 @@ void loop() {
     runSpectrumScan();
     drawSpectrumDisplay();
   } 
-  // 5. LoRa 分析模式
+  // 6. LoRa 分析模式
   else {
     if (isLocked) {
       if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
@@ -292,7 +355,118 @@ void loop() {
   }
 }
 
-// 频谱扫描与底噪/峰值算法
+// 读取 ADC 原始引脚毫伏值 (含 32次采样)
+uint32_t readRawPinMillivolts() {
+  digitalWrite(VEXT_CTRL_PIN, LOW);
+  delayMicroseconds(3000);
+
+  analogRead(VBAT_ADC_PIN); // 丢弃首帧
+
+  uint32_t rawSum = 0;
+  for (int i = 0; i < 32; i++) {
+    rawSum += analogRead(VBAT_ADC_PIN);
+    delayMicroseconds(100);
+  }
+  uint32_t rawAvg = rawSum / 32;
+
+  return esp_adc_cal_raw_to_voltage(rawAvg, &adc_chars);
+}
+
+// 基于 NVS 动态校准系数读取电压
+float readBatteryVoltage() {
+  uint32_t pinmV = readRawPinMillivolts();
+  float instantVbat = ((float)pinmV * vbatCalFactor) / 1000.0f;
+
+  if (smoothedVbat <= 0.1f) {
+    smoothedVbat = instantVbat;
+  } else {
+    smoothedVbat = (smoothedVbat * 0.90f) + (instantVbat * 0.10f);
+  }
+
+  return smoothedVbat;
+}
+
+// 电池电量百分比计算
+int getBatteryPercent(float vbat) {
+  int calcPct = 0;
+
+  if (vbat >= 4.18f) {
+    calcPct = 100;
+  } else if (vbat >= 3.82f) {
+    calcPct = 65 + (int)((vbat - 3.82f) / (4.18f - 3.82f) * 35.0f);
+  } else if (vbat >= 3.60f) {
+    calcPct = 20 + (int)((vbat - 3.60f) / (3.82f - 3.60f) * 45.0f);
+  } else if (vbat >= 3.30f) {
+    calcPct = 0 + (int)((vbat - 3.30f) / (3.60f - 3.30f) * 20.0f);
+  } else {
+    calcPct = 0;
+  }
+
+  calcPct = constrain(calcPct, 0, 100);
+
+  if (displayedBatPct == -1 || abs(calcPct - displayedBatPct) >= 2) {
+    displayedBatPct = calcPct;
+  }
+  return displayedBatPct;
+}
+
+// 绘制电池校准界面
+void drawCalibDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(10, 0);
+  display.print("= BAT CALIBRATE =");
+  display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+
+  float nowV = readBatteryVoltage();
+  display.setCursor(0, 15);
+  display.printf("Current: %.3fV", nowV);
+
+  display.setCursor(0, 27);
+  display.printf("Factor : %.4f", vbatCalFactor);
+
+  // 反显可调的目标测量值
+  display.fillRect(0, 39, 128, 13, SSD1306_WHITE);
+  display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+  display.setCursor(2, 42);
+  display.printf("Meter : > %.2fV <", targetCalibVoltage);
+
+  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+  display.setCursor(0, 55);
+  display.print("Click:Adj Hold:Save");
+
+  display.display();
+}
+
+void drawMenuDisplay() {
+  display.clearDisplay();
+  
+  display.setTextSize(1);
+  display.setCursor(20, 0);
+  display.println("= SELECT MODE =");
+  display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+
+  const char* items[] = {"1. Spectrum Scan", "2. LoRa Receiver", "3. Calib Battery", "4. Power Off"};
+
+  for (int i = 0; i < MENU_ITEMS; i++) {
+    int yPos = 13 + i * 12;
+    if (menuSelection == i) {
+      display.fillRect(5, yPos, 118, 11, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    } else {
+      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    }
+    display.setCursor(8, yPos + 2);
+    display.println(items[i]);
+  }
+
+  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+  display.display();
+}
+
+// 频谱扫描逻辑
 void runSpectrumScan() {
   float step = (specEndFreq - specStartFreq) / SPEC_CHANNELS;
   maxFoundRssi = -160.0;
@@ -318,7 +492,6 @@ void runSpectrumScan() {
     }
   }
 
-  // 1. 底噪平滑算法
   float instantAvgNoise = rssiSum / SPEC_CHANNELS;
   smoothedNoiseFloor = (smoothedNoiseFloor * 0.85) + (instantAvgNoise * 0.15);
   
@@ -327,14 +500,12 @@ void runSpectrumScan() {
     lastNoiseUpdateMs = millis();
   }
 
-  // 2. 峰值防抖算法
   if ((maxFoundRssi > displayedPeakRssi + 3.0) || (millis() - lastPeakUpdateMs > 1500)) {
     displayedPeakFreq = rawPeakFreq;
     displayedPeakRssi = maxFoundRssi;
     lastPeakUpdateMs = millis();
   }
 
-  // 3. 瀑布图更新
   int wfLines = WATERFALL_H - 2;
   for (int y = wfLines - 1; y > 0; y--) {
     for (int x = 0; x < SPEC_CHANNELS; x++) {
@@ -355,13 +526,11 @@ void drawSpectrumDisplay() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  // 顶栏：显示最高峰值点频率
   char topBuf[16];
   snprintf(topBuf, sizeof(topBuf), "P:%.2f", displayedPeakFreq);
   display.setCursor(0, 0);
   display.print(topBuf);
 
-  // 顶栏右侧：平滑防抖电池电量
   float vbat = readBatteryVoltage();
   int pct = getBatteryPercent(vbat);
   char batStr[8];
@@ -370,7 +539,6 @@ void drawSpectrumDisplay() {
   display.setCursor(batX, 0);
   display.print(batStr);
 
-  // 1. 绘制频谱柱状图
   display.drawRect(SPEC_BOX_X, SPEC_BOX_Y, SPEC_BOX_W, SPEC_BOX_H, SSD1306_WHITE);
   int innerX = SPEC_BOX_X + 1;
   int innerY = SPEC_BOX_Y + 1;
@@ -385,7 +553,6 @@ void drawSpectrumDisplay() {
     }
   }
 
-  // 嵌入：框内右上角绘制黑底遮罩与平滑底噪 (NF: -XXdBm)
   char noiseBuf[12];
   snprintf(noiseBuf, sizeof(noiseBuf), "NF:%.0f", displayedNoiseFloor);
   int noiseTextW = strlen(noiseBuf) * 6;
@@ -395,7 +562,6 @@ void drawSpectrumDisplay() {
   display.setCursor(noiseBoxX, SPEC_BOX_Y + 3);
   display.print(noiseBuf);
 
-  // 2. 瀑布图绘制
   display.drawRect(WATERFALL_X, WATERFALL_Y, WATERFALL_W, WATERFALL_H, SSD1306_WHITE);
   int wfInnerX = WATERFALL_X + 1;
   int wfInnerY = WATERFALL_Y + 1;
@@ -415,7 +581,6 @@ void drawSpectrumDisplay() {
     }
   }
 
-  // 3. 底栏：[中心频率] [Span 跨度] [Step 步进]
   display.setCursor(0, 56);
   display.printf("C:%.1fM", specCenterFreq);
   
@@ -506,89 +671,6 @@ void drawMainDisplay() {
   display.print(sfCrBuf);
 
   display.display();
-}
-
-void drawMenuDisplay() {
-  display.clearDisplay();
-  
-  display.setTextSize(1);
-  display.setCursor(20, 2);
-  display.println("= SELECT MODE =");
-  display.drawFastHLine(0, 12, 128, SSD1306_WHITE);
-
-  const char* items[] = {"1. Spectrum Scan", "2. LoRa Receiver", "3. Power Off"};
-
-  for (int i = 0; i < 3; i++) {
-    int yPos = 16 + i * 16;
-    if (menuSelection == i) {
-      display.fillRect(10, yPos, 108, 14, SSD1306_WHITE);
-      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    } else {
-      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-    }
-    display.setCursor(15, yPos + 3);
-    display.println(items[i]);
-  }
-
-  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-  display.display();
-}
-
-// 重新设计的校准版电池电压读取函数
-float readBatteryVoltage() {
-  // 1. 确保 VEXT 分压网络开启
-  digitalWrite(VEXT_CTRL_PIN, LOW);
-  delayMicroseconds(2000); // 给 RC 分压网络充足的充放电稳定时间
-
-  // 2. 丢弃第一组不稳定采样
-  analogRead(VBAT_ADC_PIN);
-
-  // 3. 16次均值滤波
-  uint32_t rawSum = 0;
-  for (int i = 0; i < 16; i++) {
-    rawSum += analogRead(VBAT_ADC_PIN);
-    delayMicroseconds(100);
-  }
-  float rawAvg = (float)rawSum / 16.0;
-
-  // 4. 校准公式：考虑 ESP32 板载 ADC 非线性偏高的修正系数 (~4.18)
-  // 当 ADC = 4095 时对应最高输入，结合 3.3V 参考电压与芯片测量偏置校正
-  float instantVbat = (rawAvg / 4095.0) * 3.3f * 4.18f;
-
-  // 5. EMA 一阶平滑滤波
-  if (smoothedVbat <= 0.1f) {
-    smoothedVbat = instantVbat;
-  } else {
-    smoothedVbat = (smoothedVbat * 0.95f) + (instantVbat * 0.05f);
-  }
-
-  return smoothedVbat;
-}
-
-// 契合 3.7V 锂电池放电特性的分段映射逻辑
-int getBatteryPercent(float vbat) {
-  int calcPct = 0;
-
-  // 锂电池放电曲线并非线性，3.7V~4.0V 占据 70% 平台区
-  if (vbat >= 4.15f) {
-    calcPct = 100;
-  } else if (vbat >= 3.85f) {
-    calcPct = 70 + (int)((vbat - 3.85f) / (4.15f - 3.85f) * 30.0f);
-  } else if (vbat >= 3.65f) {
-    calcPct = 30 + (int)((vbat - 3.65f) / (3.85f - 3.65f) * 40.0f);
-  } else if (vbat >= 3.40f) {
-    calcPct = 5 + (int)((vbat - 3.40f) / (3.65f - 3.40f) * 25.0f);
-  } else {
-    calcPct = 0;
-  }
-
-  calcPct = constrain(calcPct, 0, 100);
-
-  // 防抖锁步，变化大于 2% 时才更新数字
-  if (displayedBatPct == -1 || abs(calcPct - displayedBatPct) >= 2) {
-    displayedBatPct = calcPct;
-  }
-  return displayedBatPct;
 }
 
 void powerOff() {
