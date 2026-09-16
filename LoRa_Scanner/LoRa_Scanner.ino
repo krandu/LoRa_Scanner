@@ -38,7 +38,7 @@ const unsigned long AUTO_POWER_OFF_MS = 10 * 60 * 1000UL; // 10分钟无操作�
 unsigned long lastActivityMs = 0;
 
 // ================= 模式与状态 =================
-enum SystemMode { MODE_SPECTRUM, MODE_LORA_ANALYZER };
+enum SystemMode { MODE_SPECTRUM, MODE_LORA_ANALYZER, MODE_FSK_ANALYZER };
 SystemMode currentMode = MODE_SPECTRUM; 
 
 // 跨度/步进结构
@@ -89,20 +89,38 @@ const unsigned long NOISE_HOLD_TIME_MS = 1500;
 float maxFoundRssi = -160.0;
 float minFoundRssi = 0.0; 
 
-// LoRa 分析模式变量
-const float FREQ_LIST[] = { 438.150, 438.125, 438.000, 438.500 }; 
-const int FREQ_COUNT = sizeof(FREQ_LIST) / sizeof(FREQ_LIST[0]);
-int freqIdx = 0;
-float currentFreq = FREQ_LIST[0];
-long signalBandwidth = 125E3; 
+// ---------------- LoRa 分析模式变量 ----------------
+const float LORA_FREQ_LIST[] = { 438.150, 438.125, 438.000, 438.500 }; 
+const int LORA_FREQ_COUNT = sizeof(LORA_FREQ_LIST) / sizeof(LORA_FREQ_LIST[0]);
+int loraFreqIdx = 0;
+float currentLoraFreq = LORA_FREQ_LIST[0];
+long loraBandwidth = 125E3; 
 
 struct LoRaCombo { uint8_t sf; uint8_t cr; };
-const LoRaCombo COMBO_LIST[] = {
+const LoRaCombo LORA_COMBO_LIST[] = {
   {12, 5}, {7, 5}, {8, 5}, {9, 5}, {10, 5}, {11, 5}, {7, 8}, {12, 8}
 };
-const int COMBO_COUNT = sizeof(COMBO_LIST) / sizeof(COMBO_LIST[0]);
-int comboIdx = 0; 
+const int LORA_COMBO_COUNT = sizeof(LORA_COMBO_LIST) / sizeof(LORA_COMBO_LIST[0]);
+int loraComboIdx = 0; 
 
+// ---------------- FSK 分析模式变量 ----------------
+const float FSK_FREQ_LIST[] = { 434.000, 436.000, 437.000, 438.000, 440.000 };
+const int FSK_FREQ_COUNT = sizeof(FSK_FREQ_LIST) / sizeof(FSK_FREQ_LIST[0]);
+int fskFreqIdx = 0;
+float currentFskFreq = FSK_FREQ_LIST[0];
+long fskRxBandwidth = 62.5E3; // 固定带宽 62.5kHz
+
+struct FskCombo { long bitrate; long freqDev; const char* label; };
+const FskCombo FSK_COMBO_LIST[] = {
+  { 4800, 25000, "4.8k/25k" },
+  { 1200,  5000, "1.2k/5k"  },
+  { 9600, 19200, "9.6k/19.2k"},
+  {19200, 25000, "19.2k/25k"}
+};
+const int FSK_COMBO_COUNT = sizeof(FSK_COMBO_LIST) / sizeof(FSK_COMBO_LIST[0]);
+int fskComboIdx = 0;
+
+// 通用波形与历史接收数据框
 #define BOX_X 8
 #define BOX_Y 12
 #define BOX_W 112
@@ -132,12 +150,13 @@ bool isWaitingForClick = false;
 bool inMenu = false;
 bool inCalibUI = false;
 int menuSelection = 0; 
-const int MENU_ITEMS = 4; // 1.Spectrum 2.LoRa 3.Calib Bat 4.Power Off
+const int MENU_ITEMS = 5; // 1.Spectrum 2.LoRa 3.FSK 4.Calib Bat 5.Power Off
 
 float targetCalibVoltage = 3.80f; // 万用表测量参考电压设定值
 
 // 函数声明
 void applyLoRaConfig();
+void applyFskConfig();
 void runSpectrumScan();
 void sampleRSSI();
 void drawMainDisplay();
@@ -156,7 +175,7 @@ void loadCalibFactor();
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n--- Heltec WiFi LoRa 32 V2 (Auto Calib) ---");
+  Serial.println("\n--- Heltec WiFi LoRa 32 V2 (LoRa & FSK Receiver) ---");
 
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
@@ -198,7 +217,7 @@ void setup() {
 
   updateSpanFreqs();
 
-  if (!LoRa.begin(currentFreq * 1E6)) {
+  if (!LoRa.begin(currentLoraFreq * 1E6)) {
     Serial.println("[ERR] LoRa Chip Init Failed!");
     display.clearDisplay();
     display.setCursor(20, 25);
@@ -214,21 +233,17 @@ void setup() {
   lastActivityMs = millis();
 }
 
-// 加载 Flash 存储的参数
 void loadCalibFactor() {
-  prefs.begin("bat_cal", true); // 只读模式
+  prefs.begin("bat_cal", true);
   vbatCalFactor = prefs.getFloat("factor", 4.90f);
   prefs.end();
-  Serial.printf("[NVS] Loaded Calibration Factor: %.4f\n", vbatCalFactor);
 }
 
-// 保存参数到 Flash
 void saveCalibFactor(float factor) {
-  prefs.begin("bat_cal", false); // 读写模式
+  prefs.begin("bat_cal", false);
   prefs.putFloat("factor", factor);
   prefs.end();
   vbatCalFactor = factor;
-  Serial.printf("[NVS] Saved New Calibration Factor: %.4f\n", vbatCalFactor);
 }
 
 void updateSpanFreqs() {
@@ -256,23 +271,25 @@ void loop() {
       inMenu = true;
     } else {
       inMenu = !inMenu;
-      if (inMenu) menuSelection = (currentMode == MODE_SPECTRUM) ? 0 : 1;
+      if (inMenu) {
+        if (currentMode == MODE_SPECTRUM) menuSelection = 0;
+        else if (currentMode == MODE_LORA_ANALYZER) menuSelection = 1;
+        else if (currentMode == MODE_FSK_ANALYZER) menuSelection = 2;
+      }
     }
   }
 
   // 3. 校准界面交互
   if (inCalibUI) {
     if (evt == SINGLE_CLICK) {
-      // 步进切换万用表测量值 (+0.05V，循环 3.30V ~ 4.25V)
       targetCalibVoltage += 0.05f;
       if (targetCalibVoltage > 4.25f) targetCalibVoltage = 3.30f;
     } else if (evt == LONG_PRESS) {
-      // 长按保存：自动计算新系数并存盘
       uint32_t pinmV = readRawPinMillivolts();
       if (pinmV > 0) {
         float newFactor = (targetCalibVoltage * 1000.0f) / (float)pinmV;
         saveCalibFactor(newFactor);
-        smoothedVbat = 0.0f; // 重置滤波缓冲
+        smoothedVbat = 0.0f;
       }
       inCalibUI = false;
       inMenu = false;
@@ -292,10 +309,14 @@ void loop() {
         applyLoRaConfig();
         inMenu = false;
       } else if (menuSelection == 2) {
-        inCalibUI = true; // 进入电池校准模式
-        targetCalibVoltage = readBatteryVoltage(); // 以当前测得电压为基准
-        if (targetCalibVoltage < 3.3f) targetCalibVoltage = 3.80f;
+        currentMode = MODE_FSK_ANALYZER;
+        applyFskConfig();
+        inMenu = false;
       } else if (menuSelection == 3) {
+        inCalibUI = true;
+        targetCalibVoltage = readBatteryVoltage();
+        if (targetCalibVoltage < 3.3f) targetCalibVoltage = 3.80f;
+      } else if (menuSelection == 4) {
         powerOff();
       }
     }
@@ -315,20 +336,20 @@ void loop() {
     runSpectrumScan();
     drawSpectrumDisplay();
   } 
-  // 6. LoRa 分析模式
-  else {
+  // 6. LoRa 解码模式
+  else if (currentMode == MODE_LORA_ANALYZER) {
     if (isLocked) {
       if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
         isLocked = false;
         decodedPayload = "";
       }
     } else {
-      if (evt == SINGLE_CLICK) {
-        comboIdx = (comboIdx + 1) % COMBO_COUNT;
+      if (evt == SINGLE_CLICK) { // 短按切换频率
+        loraFreqIdx = (loraFreqIdx + 1) % LORA_FREQ_COUNT;
+        currentLoraFreq = LORA_FREQ_LIST[loraFreqIdx];
         applyLoRaConfig();
-      } else if (evt == LONG_PRESS) {
-        freqIdx = (freqIdx + 1) % FREQ_COUNT;
-        currentFreq = FREQ_LIST[freqIdx];
+      } else if (evt == LONG_PRESS) { // 长按切换 SF/CR 组合
+        loraComboIdx = (loraComboIdx + 1) % LORA_COMBO_COUNT;
         applyLoRaConfig();
       }
     }
@@ -353,64 +374,189 @@ void loop() {
 
     drawMainDisplay();
   }
-}
+  // 7. FSK 解码模式 (新增)
+  else if (currentMode == MODE_FSK_ANALYZER) {
+    if (isLocked) {
+      if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
+        isLocked = false;
+        decodedPayload = "";
+      }
+    } else {
+      if (evt == SINGLE_CLICK) { // 短按切换频率 (434, 436, 437, 438, 440 MHz)
+        fskFreqIdx = (fskFreqIdx + 1) % FSK_FREQ_COUNT;
+        currentFskFreq = FSK_FREQ_LIST[fskFreqIdx];
+        applyFskConfig();
+      } else if (evt == LONG_PRESS) { // 长按切换速率与频偏组合
+        fskComboIdx = (fskComboIdx + 1) % FSK_COMBO_COUNT;
+        applyFskConfig();
+      }
+    }
 
-// 读取 ADC 原始引脚毫伏值 (含 32次采样)
-uint32_t readRawPinMillivolts() {
-  digitalWrite(VEXT_CTRL_PIN, LOW);
-  delayMicroseconds(3000);
+    if (millis() - lastSampleMs >= 30) {
+      lastSampleMs = millis();
+      sampleRSSI();
+    }
 
-  analogRead(VBAT_ADC_PIN); // 丢弃首帧
+    int packetSize = LoRa.parsePacket();
+    if (packetSize) {
+      String incoming = "";
+      while (LoRa.available()) incoming += (char)LoRa.read();
+      
+      isLocked = true;
+      int aprsMsgIdx = incoming.indexOf("::");
+      decodedPayload = (aprsMsgIdx != -1) ? incoming.substring(aprsMsgIdx + 2) : incoming;
 
-  uint32_t rawSum = 0;
-  for (int i = 0; i < 32; i++) {
-    rawSum += analogRead(VBAT_ADC_PIN);
-    delayMicroseconds(100);
+      lastPacketRssi = LoRa.packetRssi();
+      lastPacketSnr = 0.0; // FSK 模式下无 SNR 指标，置 0
+    }
+
+    drawMainDisplay();
   }
-  uint32_t rawAvg = rawSum / 32;
-
-  return esp_adc_cal_raw_to_voltage(rawAvg, &adc_chars);
 }
 
-// 基于 NVS 动态校准系数读取电压
-float readBatteryVoltage() {
-  uint32_t pinmV = readRawPinMillivolts();
-  float instantVbat = ((float)pinmV * vbatCalFactor) / 1000.0f;
+// 设定 LoRa 调制参数
+void applyLoRaConfig() {
+  LoRa.setFrequency(currentLoraFreq * 1E6);
+  LoRa.setSignalBandwidth(loraBandwidth);
+  LoRa.setSpreadingFactor(LORA_COMBO_LIST[loraComboIdx].sf);
+  LoRa.setCodingRate4(LORA_COMBO_LIST[loraComboIdx].cr);
+  LoRa.receive();
+}
 
-  if (smoothedVbat <= 0.1f) {
-    smoothedVbat = instantVbat;
+// 设定 FSK 调制参数 (固定带宽 62.5kHz)
+void applyFskConfig() {
+  LoRa.setFskMode(); // 切换底层为 FSK 调制
+  LoRa.setFrequency(currentFskFreq * 1E6);
+  LoRa.setRxBandwidth(fskRxBandwidth); // 设置 62.5kHz 带宽
+  LoRa.setFskBitRate(FSK_COMBO_LIST[fskComboIdx].bitrate);
+  LoRa.setFskFrequencyDeviation(FSK_COMBO_LIST[fskComboIdx].freqDev);
+  LoRa.receive();
+}
+
+void sampleRSSI() {
+  float rawRssi = LoRa.rssi(); 
+  rssiHistory[rssiWrIdx] = rawRssi;
+  rssiWrIdx = (rssiWrIdx + 1) % RSSI_HIST_LEN;
+}
+
+// 绘制主解码界面 (LoRa 与 FSK 通用适配)
+void drawMainDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // 1. 顶栏：频率与电量
+  display.setCursor(0, 0);
+  if (currentMode == MODE_LORA_ANALYZER) {
+    display.printf("%.3fM L", currentLoraFreq);
   } else {
-    smoothedVbat = (smoothedVbat * 0.90f) + (instantVbat * 0.10f);
+    display.printf("%.3fM F", currentFskFreq);
   }
+  
+  float vbat = readBatteryVoltage();
+  int pct = getBatteryPercent(vbat);
+  char batStr[8];
+  snprintf(batStr, sizeof(batStr), "%d%%", pct);
+  int batX = SCREEN_WIDTH - (strlen(batStr) * 6);
+  display.setCursor(batX, 0);
+  display.print(batStr);
 
-  return smoothedVbat;
-}
+  // 2. 中间接收/波形框
+  display.drawRect(BOX_X - 1, BOX_Y - 1, BOX_W + 2, BOX_H + 2, SSD1306_WHITE);
 
-// 电池电量百分比计算
-int getBatteryPercent(float vbat) {
-  int calcPct = 0;
-
-  if (vbat >= 4.18f) {
-    calcPct = 100;
-  } else if (vbat >= 3.82f) {
-    calcPct = 65 + (int)((vbat - 3.82f) / (4.18f - 3.82f) * 35.0f);
-  } else if (vbat >= 3.60f) {
-    calcPct = 20 + (int)((vbat - 3.60f) / (3.82f - 3.60f) * 45.0f);
-  } else if (vbat >= 3.30f) {
-    calcPct = 0 + (int)((vbat - 3.30f) / (3.60f - 3.30f) * 20.0f);
+  if (isLocked) {
+    display.setTextWrap(false);
+    String line1 = "", line2 = "";
+    if (decodedPayload.length() <= 17) {
+      line1 = decodedPayload;
+    } else {
+      line1 = decodedPayload.substring(0, 17);
+      line2 = (decodedPayload.length() > 32) ? (decodedPayload.substring(17, 31) + "...") : decodedPayload.substring(17);
+    }
+    display.setCursor(BOX_X + 2, BOX_Y + 2);
+    display.print(line1.length() > 0 ? line1 : "<EMPTY>");
+    if (line2.length() > 0) {
+      display.setCursor(BOX_X + 2, BOX_Y + 11);
+      display.print(line2);
+    }
+    display.setCursor(BOX_X + 2, BOX_Y + 22);
+    if (currentMode == MODE_LORA_ANALYZER) {
+      display.printf("R:%ddBm S:%.1fdB", lastPacketRssi, lastPacketSnr);
+    } else {
+      display.printf("R:%ddBm (FSK)", lastPacketRssi);
+    }
   } else {
-    calcPct = 0;
+    display.setTextWrap(false);
+    float minRssi = 0.0;
+    for (int i = 0; i < RSSI_HIST_LEN; i++) {
+      if (rssiHistory[i] < minRssi) minRssi = rssiHistory[i];
+    }
+    if (minRssi > -60.0) minRssi = -120.0;
+
+    for (int col = 0; col < BOX_W; col++) {
+      int idx = (rssiWrIdx + col) % RSSI_HIST_LEN;
+      float val = rssiHistory[idx];
+      int lineH = map((int)constrain(val, minRssi, -30.0), (int)minRssi, -30, 0, BOX_H - 1);
+      if (lineH > 0) {
+        display.drawFastVLine(BOX_X + col, BOX_Y + BOX_H - lineH, lineH, SSD1306_WHITE);
+      }
+    }
   }
 
-  calcPct = constrain(calcPct, 0, 100);
-
-  if (displayedBatPct == -1 || abs(calcPct - displayedBatPct) >= 2) {
-    displayedBatPct = calcPct;
+  // 3. 底栏：带宽与调制参数
+  int bottomY = 52;
+  display.setCursor(0, bottomY);
+  if (currentMode == MODE_LORA_ANALYZER) {
+    display.printf("BW:%.0fK", loraBandwidth / 1000.0);
+    char sfCrBuf[16];
+    snprintf(sfCrBuf, sizeof(sfCrBuf), "SF%d/CR%d", LORA_COMBO_LIST[loraComboIdx].sf, LORA_COMBO_LIST[loraComboIdx].cr);
+    int xPos = SCREEN_WIDTH - (strlen(sfCrBuf) * 6);
+    display.setCursor(xPos, bottomY);
+    display.print(sfCrBuf);
+  } else {
+    display.print("BW:62.5K");
+    const char* fskParamStr = FSK_COMBO_LIST[fskComboIdx].label;
+    int xPos = SCREEN_WIDTH - (strlen(fskParamStr) * 6);
+    display.setCursor(xPos, bottomY);
+    display.print(fskParamStr);
   }
-  return displayedBatPct;
+
+  display.display();
 }
 
-// 绘制电池校准界面
+void drawMenuDisplay() {
+  display.clearDisplay();
+  
+  display.setTextSize(1);
+  display.setCursor(18, 0);
+  display.println("= SELECT MODE =");
+  display.drawFastHLine(0, 9, 128, SSD1306_WHITE);
+
+  const char* items[] = {
+    "1. Spectrum Scan", 
+    "2. LoRa Receiver", 
+    "3. FSK Receiver", 
+    "4. Calib Battery", 
+    "5. Power Off"
+  };
+
+  for (int i = 0; i < MENU_ITEMS; i++) {
+    int yPos = 11 + i * 10;
+    if (menuSelection == i) {
+      display.fillRect(4, yPos, 120, 10, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    } else {
+      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    }
+    display.setCursor(6, yPos + 1);
+    display.println(items[i]);
+  }
+
+  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+  display.display();
+}
+
+// 电池校准界面绘制
 void drawCalibDisplay() {
   display.clearDisplay();
   display.setTextSize(1);
@@ -427,7 +573,6 @@ void drawCalibDisplay() {
   display.setCursor(0, 27);
   display.printf("Factor : %.4f", vbatCalFactor);
 
-  // 反显可调的目标测量值
   display.fillRect(0, 39, 128, 13, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
   display.setCursor(2, 42);
@@ -437,32 +582,6 @@ void drawCalibDisplay() {
   display.setCursor(0, 55);
   display.print("Click:Adj Hold:Save");
 
-  display.display();
-}
-
-void drawMenuDisplay() {
-  display.clearDisplay();
-  
-  display.setTextSize(1);
-  display.setCursor(20, 0);
-  display.println("= SELECT MODE =");
-  display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
-
-  const char* items[] = {"1. Spectrum Scan", "2. LoRa Receiver", "3. Calib Battery", "4. Power Off"};
-
-  for (int i = 0; i < MENU_ITEMS; i++) {
-    int yPos = 13 + i * 12;
-    if (menuSelection == i) {
-      display.fillRect(5, yPos, 118, 11, SSD1306_WHITE);
-      display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
-    } else {
-      display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
-    }
-    display.setCursor(8, yPos + 2);
-    display.println(items[i]);
-  }
-
-  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
   display.display();
 }
 
@@ -593,84 +712,59 @@ void drawSpectrumDisplay() {
   display.display();
 }
 
-void applyLoRaConfig() {
-  LoRa.setFrequency(currentFreq * 1E6);
-  LoRa.setSignalBandwidth(signalBandwidth);
-  LoRa.setSpreadingFactor(COMBO_LIST[comboIdx].sf);
-  LoRa.setCodingRate4(COMBO_LIST[comboIdx].cr);
-  LoRa.receive();
+// 读取 ADC 原始引脚毫伏值
+uint32_t readRawPinMillivolts() {
+  digitalWrite(VEXT_CTRL_PIN, LOW);
+  delayMicroseconds(3000);
+
+  analogRead(VBAT_ADC_PIN);
+
+  uint32_t rawSum = 0;
+  for (int i = 0; i < 32; i++) {
+    rawSum += analogRead(VBAT_ADC_PIN);
+    delayMicroseconds(100);
+  }
+  uint32_t rawAvg = rawSum / 32;
+
+  return esp_adc_cal_raw_to_voltage(rawAvg, &adc_chars);
 }
 
-void sampleRSSI() {
-  float rawRssi = LoRa.rssi(); 
-  rssiHistory[rssiWrIdx] = rawRssi;
-  rssiWrIdx = (rssiWrIdx + 1) % RSSI_HIST_LEN;
-}
+// 基于 NVS 动态校准系数读取电压
+float readBatteryVoltage() {
+  uint32_t pinmV = readRawPinMillivolts();
+  float instantVbat = ((float)pinmV * vbatCalFactor) / 1000.0f;
 
-void drawMainDisplay() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  display.setCursor(0, 0);
-  display.printf("%.3fM", currentFreq);
-  
-  float vbat = readBatteryVoltage();
-  int pct = getBatteryPercent(vbat);
-  char batStr[8];
-  snprintf(batStr, sizeof(batStr), "%d%%", pct);
-  int batX = SCREEN_WIDTH - (strlen(batStr) * 6);
-  display.setCursor(batX, 0);
-  display.print(batStr);
-
-  display.drawRect(BOX_X - 1, BOX_Y - 1, BOX_W + 2, BOX_H + 2, SSD1306_WHITE);
-
-  if (isLocked) {
-    display.setTextWrap(false);
-    String line1 = "", line2 = "";
-    if (decodedPayload.length() <= 17) {
-      line1 = decodedPayload;
-    } else {
-      line1 = decodedPayload.substring(0, 17);
-      line2 = (decodedPayload.length() > 32) ? (decodedPayload.substring(17, 31) + "...") : decodedPayload.substring(17);
-    }
-    display.setCursor(BOX_X + 2, BOX_Y + 2);
-    display.print(line1.length() > 0 ? line1 : "<EMPTY>");
-    if (line2.length() > 0) {
-      display.setCursor(BOX_X + 2, BOX_Y + 11);
-      display.print(line2);
-    }
-    display.setCursor(BOX_X + 2, BOX_Y + 22);
-    display.printf("R:%ddBm S:%.1fdB", lastPacketRssi, lastPacketSnr);
+  if (smoothedVbat <= 0.1f) {
+    smoothedVbat = instantVbat;
   } else {
-    display.setTextWrap(false);
-    float minRssi = 0.0;
-    for (int i = 0; i < RSSI_HIST_LEN; i++) {
-      if (rssiHistory[i] < minRssi) minRssi = rssiHistory[i];
-    }
-    if (minRssi > -60.0) minRssi = -120.0;
-
-    for (int col = 0; col < BOX_W; col++) {
-      int idx = (rssiWrIdx + col) % RSSI_HIST_LEN;
-      float val = rssiHistory[idx];
-      int lineH = map((int)constrain(val, minRssi, -30.0), (int)minRssi, -30, 0, BOX_H - 1);
-      if (lineH > 0) {
-        display.drawFastVLine(BOX_X + col, BOX_Y + BOX_H - lineH, lineH, SSD1306_WHITE);
-      }
-    }
+    smoothedVbat = (smoothedVbat * 0.90f) + (instantVbat * 0.10f);
   }
 
-  int bottomY = 52;
-  display.setCursor(0, bottomY);
-  display.printf("BW:%.0fK", signalBandwidth / 1000.0);
+  return smoothedVbat;
+}
 
-  char sfCrBuf[16];
-  snprintf(sfCrBuf, sizeof(sfCrBuf), "SF%d/CR%d", COMBO_LIST[comboIdx].sf, COMBO_LIST[comboIdx].cr);
-  int xPos = SCREEN_WIDTH - (strlen(sfCrBuf) * 6);
-  display.setCursor(xPos, bottomY);
-  display.print(sfCrBuf);
+// 电池电量百分比计算
+int getBatteryPercent(float vbat) {
+  int calcPct = 0;
 
-  display.display();
+  if (vbat >= 4.18f) {
+    calcPct = 100;
+  } else if (vbat >= 3.82f) {
+    calcPct = 65 + (int)((vbat - 3.82f) / (4.18f - 3.82f) * 35.0f);
+  } else if (vbat >= 3.60f) {
+    calcPct = 20 + (int)((vbat - 3.60f) / (3.82f - 3.60f) * 45.0f);
+  } else if (vbat >= 3.30f) {
+    calcPct = 0 + (int)((vbat - 3.30f) / (3.60f - 3.30f) * 20.0f);
+  } else {
+    calcPct = 0;
+  }
+
+  calcPct = constrain(calcPct, 0, 100);
+
+  if (displayedBatPct == -1 || abs(calcPct - displayedBatPct) >= 2) {
+    displayedBatPct = calcPct;
+  }
+  return displayedBatPct;
 }
 
 void powerOff() {
