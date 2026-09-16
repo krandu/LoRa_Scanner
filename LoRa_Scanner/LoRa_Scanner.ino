@@ -170,9 +170,10 @@ void setup() {
   display.println(F("Initializing..."));
   display.display();
 
-  // 配置 ESP32 ADC 采样
+  // 配置 ESP32 ADC 采样 (使用 11dB 衰减)
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
+  pinMode(VBAT_ADC_PIN, INPUT);
 
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
@@ -238,14 +239,12 @@ void loop() {
   // 4. 频谱扫描模式 (短按切中心频率，长按切 Span)
   else if (currentMode == MODE_SPECTRUM) {
     if (evt == SINGLE_CLICK) {
-      // 短按：按 1.0MHz 步进步进切换中心频率 (范围：431.0 ~ 439.0 MHz)
       specCenterFreq += 1.0;
       if (specCenterFreq > 439.0) {
         specCenterFreq = 431.0;
       }
       updateSpanFreqs();
     } else if (evt == LONG_PRESS) {
-      // 长按：切换 Span 跨度 (10M -> 5M -> 2M)
       spanIdx = (spanIdx + 1) % SPAN_COUNT;
       updateSpanFreqs();
     }
@@ -416,8 +415,7 @@ void drawSpectrumDisplay() {
     }
   }
 
-  // 3. 简化后的精细底栏：[中心频率] [Span 跨度] [Step 步进]
-  // 示例显示：C:435.0M  S:2M  K:50k
+  // 3. 底栏：[中心频率] [Span 跨度] [Step 步进]
   display.setCursor(0, 56);
   display.printf("C:%.1fM", specCenterFreq);
   
@@ -536,35 +534,57 @@ void drawMenuDisplay() {
   display.display();
 }
 
-// Heltec WiFi LoRa 32 V2 100K/390K 分压，精准分压系数 4.9
+// 重新设计的校准版电池电压读取函数
 float readBatteryVoltage() {
-  pinMode(VEXT_CTRL_PIN, OUTPUT);
+  // 1. 确保 VEXT 分压网络开启
   digitalWrite(VEXT_CTRL_PIN, LOW);
-  delayMicroseconds(500);
+  delayMicroseconds(2000); // 给 RC 分压网络充足的充放电稳定时间
 
-  int rawSum = 0;
-  for (int i = 0; i < 10; i++) {
+  // 2. 丢弃第一组不稳定采样
+  analogRead(VBAT_ADC_PIN);
+
+  // 3. 16次均值滤波
+  uint32_t rawSum = 0;
+  for (int i = 0; i < 16; i++) {
     rawSum += analogRead(VBAT_ADC_PIN);
+    delayMicroseconds(100);
   }
-  float raw = rawSum / 10.0;
-  
-  float instantVbat = (raw / 4095.0) * 3.3 * 4.9; 
+  float rawAvg = (float)rawSum / 16.0;
 
-  if (smoothedVbat == 0.0) smoothedVbat = instantVbat;
-  smoothedVbat = (smoothedVbat * 0.9) + (instantVbat * 0.1);
+  // 4. 校准公式：考虑 ESP32 板载 ADC 非线性偏高的修正系数 (~4.18)
+  // 当 ADC = 4095 时对应最高输入，结合 3.3V 参考电压与芯片测量偏置校正
+  float instantVbat = (rawAvg / 4095.0) * 3.3f * 4.18f;
+
+  // 5. EMA 一阶平滑滤波
+  if (smoothedVbat <= 0.1f) {
+    smoothedVbat = instantVbat;
+  } else {
+    smoothedVbat = (smoothedVbat * 0.95f) + (instantVbat * 0.05f);
+  }
 
   return smoothedVbat;
 }
 
-// 滞后平滑电池百分比
+// 契合 3.7V 锂电池放电特性的分段映射逻辑
 int getBatteryPercent(float vbat) {
   int calcPct = 0;
-  if (vbat >= 4.15)      calcPct = 100;
-  else if (vbat <= 3.30) calcPct = 0;
-  else calcPct = (int)((vbat - 3.30) / (4.15 - 3.30) * 100.0);
-  
+
+  // 锂电池放电曲线并非线性，3.7V~4.0V 占据 70% 平台区
+  if (vbat >= 4.15f) {
+    calcPct = 100;
+  } else if (vbat >= 3.85f) {
+    calcPct = 70 + (int)((vbat - 3.85f) / (4.15f - 3.85f) * 30.0f);
+  } else if (vbat >= 3.65f) {
+    calcPct = 30 + (int)((vbat - 3.65f) / (3.85f - 3.65f) * 40.0f);
+  } else if (vbat >= 3.40f) {
+    calcPct = 5 + (int)((vbat - 3.40f) / (3.65f - 3.40f) * 25.0f);
+  } else {
+    calcPct = 0;
+  }
+
   calcPct = constrain(calcPct, 0, 100);
 
+  // 防抖锁步，变化大于 2% 时才更新数字
   if (displayedBatPct == -1 || abs(calcPct - displayedBatPct) >= 2) {
     displayedBatPct = calcPct;
   }
