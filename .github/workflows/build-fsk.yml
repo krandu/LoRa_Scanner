@@ -1,0 +1,47 @@
+name: Build FSK Receiver Firmware
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 Core
+        run: |
+          arduino-cli config init
+          arduino-cli config set board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.17
+
+      - name: Install Required Libraries
+        run: |
+          arduino-cli lib install "RadioLib"
+          arduino-cli lib install "Adafruit GFX Library"
+          arduino-cli lib install "Adafruit SSD1306"
+
+      - name: Compile FSK Scanner Firmware
+        run: |
+          mkdir -p build
+          arduino-cli compile --fqbn esp32:esp32:heltec_wifi_lora_32_V2 \
+            --output-dir ./build \
+            ./FSK_Scanner.ino
+
+      - name: Upload Firmware Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FSK_Scanner_Firmware
+          path: |
+            build/*.bin
+            build/*.elf
