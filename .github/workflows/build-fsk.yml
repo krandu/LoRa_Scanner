@@ -36,7 +36,7 @@ jobs:
           mkdir -p build
           arduino-cli compile --fqbn esp32:esp32:heltec_wifi_lora_32_V2 \
             --output-dir ./build \
-            ./FSK_Scanner.ino
+            .
 
       - name: Upload Firmware Artifact
         uses: actions/upload-artifact@v4
