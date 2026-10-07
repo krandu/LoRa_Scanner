@@ -75,20 +75,18 @@ uint8_t waterfallBuf[WATERFALL_H - 2][SPEC_CHANNELS];
 
 // ===== 频谱平滑与门限 =====
 float specSmooth[SPEC_CHANNELS];
-bool  specInit = false;           // 参数变化后重新初始化平滑缓冲
+bool  specInit = false;
 bool  peakValid = false;
 bool  displayedPeakValid = false;
 
-const float PEAK_MIN_SNR   = 8.0;   // 峰值有效门限
+const float PEAK_MIN_SNR   = 8.0;
 
-// 峰值防抖相关变量
 float rawPeakRssi = -160.0;
 float rawPeakFreq = 435.0;
 float displayedPeakFreq = 435.0;
 float displayedPeakRssi = -160.0;
 unsigned long lastPeakUpdateMs = 0;
 
-// 底噪平滑与保持变量
 float smoothedNoiseFloor = -100.0;
 float displayedNoiseFloor = -100.0;
 unsigned long lastNoiseUpdateMs = 0;
@@ -97,12 +95,14 @@ const unsigned long NOISE_HOLD_TIME_MS = 1500;
 float maxFoundRssi = -160.0;
 float minFoundRssi = 0.0;
 
-// LoRa 分析模式变量
-const float FREQ_LIST[] = { 438.150, 438.125, 438.000, 438.500 };
-const int FREQ_COUNT = sizeof(FREQ_LIST) / sizeof(FREQ_LIST[0]);
-int freqIdx = 0;
-float currentFreq = FREQ_LIST[0];
+// ================= LoRa 分析模式变量 =================
+float currentFreq = 438.150; // 当前接收频率 (MHz)
 long signalBandwidth = 125E3;
+
+// 手动输入调频控制相关变量
+bool isFreqEditing = false;
+int  digitCursor = 0; // 0: 100M, 1: 10M, 2: 1M, 3: 100k, 4: 10k, 5: 1k
+int  freqDigits[6] = {4, 3, 8, 1, 5, 0}; // 对应 438.150 MHz 的各个数位
 
 struct LoRaCombo { uint8_t sf; uint8_t cr; };
 const LoRaCombo COMBO_LIST[] = {
@@ -142,9 +142,9 @@ bool isWaitingForClick = false;
 bool inMenu = false;
 bool inCalibUI = false;
 int menuSelection = 0;
-const int MENU_ITEMS = 4; // 1.Spectrum 2.LoRa 3.Calib Bat 4.Power Off
+const int MENU_ITEMS = 4;
 
-float targetCalibVoltage = 3.80f; // 万用表测量参考电压设定值
+float targetCalibVoltage = 3.80f;
 
 // 函数声明
 void applyLoRaConfig();
@@ -164,20 +164,20 @@ void powerOff();
 void updateSpanFreqs();
 void saveCalibFactor(float factor);
 void loadCalibFactor();
+void freqDigitsToFloat();
+void floatToFreqDigits();
 
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n--- Heltec WiFi LoRa 32 V2 (Auto Calib) ---");
+  Serial.println("\n--- Heltec WiFi LoRa 32 V2 (Manual Freq Tuning) ---");
 
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
-  // 开启 VEXT (低电平开启屏幕及分压测量电路供电)
   pinMode(VEXT_CTRL_PIN, OUTPUT);
   digitalWrite(VEXT_CTRL_PIN, LOW);
   delay(50);
 
-  // 初始化 OLED 复位引脚
   pinMode(OLED_RST, OUTPUT);
   digitalWrite(OLED_RST, LOW);
   delay(20);
@@ -196,15 +196,13 @@ void setup() {
   display.println(F("Initializing..."));
   display.display();
 
-  // 配置 ESP32 ADC1 & 工厂 eFuse 校准
   adc1_config_width(ADC_WIDTH_BIT_12);
   adc1_config_channel_atten(ADC1_CHANNEL_1, ADC_ATTEN_DB_11);
   esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 1100, &adc_chars);
   pinMode(VBAT_ADC_PIN, INPUT);
 
-  // 读取 Flash 保存的校准参数
   loadCalibFactor();
-  batteryTick(true);   // 初始化电池读数
+  batteryTick(true);
 
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
@@ -220,29 +218,26 @@ void setup() {
     while (1);
   }
 
-  applySpectrumBandwidth();   // 频谱模式按步进选择接收带宽
+  applySpectrumBandwidth();
   LoRa.receive();
   for (int i = 0; i < RSSI_HIST_LEN; i++) rssiHistory[i] = -120.0;
   memset(waterfallBuf, 0, sizeof(waterfallBuf));
 
+  floatToFreqDigits(); // 将初始频率转换为数位数组
   lastActivityMs = millis();
 }
 
-// 加载 Flash 存储的参数
 void loadCalibFactor() {
-  prefs.begin("bat_cal", true); // 只读模式
+  prefs.begin("bat_cal", true);
   vbatCalFactor = prefs.getFloat("factor", 4.90f);
   prefs.end();
-  Serial.printf("[NVS] Loaded Calibration Factor: %.4f\n", vbatCalFactor);
 }
 
-// 保存参数到 Flash
 void saveCalibFactor(float factor) {
-  prefs.begin("bat_cal", false); // 读写模式
+  prefs.begin("bat_cal", false);
   prefs.putFloat("factor", factor);
   prefs.end();
   vbatCalFactor = factor;
-  Serial.printf("[NVS] Saved New Calibration Factor: %.4f\n", vbatCalFactor);
 }
 
 void updateSpanFreqs() {
@@ -251,7 +246,6 @@ void updateSpanFreqs() {
   specEndFreq   = specCenterFreq + halfSpan;
 }
 
-// 根据步进自动选择扫描带宽，避免漏扫/串扰
 void applySpectrumBandwidth() {
   float k = spanOptions[spanIdx].stepkHz;
   long bw = (k >= 250) ? 250E3 : (k >= 125) ? 125E3 : 41.7E3;
@@ -260,22 +254,45 @@ void applySpectrumBandwidth() {
   specInit = false;
 }
 
-void loop() {
-  batteryTick(false);   // 每 500ms 采样一次
+// 辅助：将 currentFreq 转为数位数组
+void floatToFreqDigits() {
+  long khz = round(currentFreq * 1000.0f);
+  freqDigits[0] = (khz / 100000) % 10;
+  freqDigits[1] = (khz / 10000) % 10;
+  freqDigits[2] = (khz / 1000) % 10;
+  freqDigits[3] = (khz / 100) % 10;
+  freqDigits[4] = (khz / 10) % 10;
+  freqDigits[5] = khz % 10;
+}
 
-  // 1. 自动关机检测
+// 辅助：将数位数组转回 currentFreq 并限制合法范围
+void freqDigitsToFloat() {
+  long khz = freqDigits[0] * 100000L +
+             freqDigits[1] * 10000L +
+             freqDigits[2] * 1000L +
+             freqDigits[3] * 100L +
+             freqDigits[4] * 10L +
+             freqDigits[5];
+  currentFreq = khz / 1000.0f;
+  if (currentFreq < 410.0f) currentFreq = 410.0f;
+  if (currentFreq > 525.0f) currentFreq = 525.0f;
+  floatToFreqDigits(); // 确保数值规整
+}
+
+void loop() {
+  batteryTick(false);
+
   if (millis() - lastActivityMs > AUTO_POWER_OFF_MS) {
     powerOff();
   }
 
-  // 2. 检测按键事件
   BtnEvent evt = checkButton();
   if (evt != NONE) {
     lastActivityMs = millis();
   }
 
-  // 双击随时进入/退出主菜单
-  if (evt == DOUBLE_CLICK) {
+  // 双击：未在编辑频率时，进入/退出主菜单
+  if (evt == DOUBLE_CLICK && !isFreqEditing) {
     if (inCalibUI) {
       inCalibUI = false;
       inMenu = true;
@@ -285,19 +302,17 @@ void loop() {
     }
   }
 
-  // 3. 校准界面交互
+  // 1. 校准界面
   if (inCalibUI) {
     if (evt == SINGLE_CLICK) {
-      // 步进切换万用表测量值 (+0.05V，循环 3.30V ~ 4.25V)
       targetCalibVoltage += 0.05f;
       if (targetCalibVoltage > 4.25f) targetCalibVoltage = 3.30f;
     } else if (evt == LONG_PRESS) {
-      // 长按保存：自动计算新系数并存盘
       uint32_t pinmV = readRawPinMillivolts();
       if (pinmV > 0) {
         float newFactor = (targetCalibVoltage * 1000.0f) / (float)pinmV;
         saveCalibFactor(newFactor);
-        smoothedVbat = 0.0f; // 重置滤波缓冲
+        smoothedVbat = 0.0f;
         batteryTick(true);
       }
       inCalibUI = false;
@@ -305,7 +320,7 @@ void loop() {
     }
     drawCalibDisplay();
   }
-  // 4. 菜单控制
+  // 2. 主菜单界面
   else if (inMenu) {
     if (evt == SINGLE_CLICK) {
       menuSelection = (menuSelection + 1) % MENU_ITEMS;
@@ -319,8 +334,8 @@ void loop() {
         applyLoRaConfig();
         inMenu = false;
       } else if (menuSelection == 2) {
-        inCalibUI = true; // 进入电池校准模式
-        targetCalibVoltage = readBatteryVoltage(); // 以当前测得电压为基准
+        inCalibUI = true;
+        targetCalibVoltage = readBatteryVoltage();
         if (targetCalibVoltage < 3.3f) targetCalibVoltage = 3.80f;
       } else if (menuSelection == 3) {
         powerOff();
@@ -328,7 +343,7 @@ void loop() {
     }
     drawMenuDisplay();
   }
-  // 5. 频谱扫描模式
+  // 3. 频谱扫描模式
   else if (currentMode == MODE_SPECTRUM) {
     if (evt == SINGLE_CLICK) {
       specCenterFreq += 1.0;
@@ -344,21 +359,42 @@ void loop() {
     runSpectrumScan();
     drawSpectrumDisplay();
   }
-  // 6. LoRa 分析模式
+  // 4. LoRa 接收解码模式 (包含手动调频控制)
   else {
     if (isLocked) {
+      // 解码锁定状态下按键解锁
       if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
         isLocked = false;
         decodedPayload = "";
       }
-    } else {
+    } 
+    // 手动调频编辑模式中
+    else if (isFreqEditing) {
       if (evt == SINGLE_CLICK) {
+        // 单击：移动输入光标到下一个数位
+        digitCursor = (digitCursor + 1) % 6;
+      } else if (evt == DOUBLE_CLICK) {
+        // 双击：当前数位 +1
+        freqDigits[digitCursor] = (freqDigits[digitCursor] + 1) % 10;
+        freqDigitsToFloat(); // 更新计算
+      } else if (evt == LONG_PRESS) {
+        // 长按：保存设置，退出编辑模式并应用新频率
+        freqDigitsToFloat();
+        applyLoRaConfig();
+        isFreqEditing = false;
+      }
+    } 
+    // 正常 LoRa 接收监听状态
+    else {
+      if (evt == SINGLE_CLICK) {
+        // 单击：切换 SF/CR 组合
         comboIdx = (comboIdx + 1) % COMBO_COUNT;
         applyLoRaConfig();
       } else if (evt == LONG_PRESS) {
-        freqIdx = (freqIdx + 1) % FREQ_COUNT;
-        currentFreq = FREQ_LIST[freqIdx];
-        applyLoRaConfig();
+        // 长按：进入手动频率调整模式
+        isFreqEditing = true;
+        digitCursor = 0;
+        floatToFreqDigits();
       }
     }
 
@@ -384,18 +420,17 @@ void loop() {
   }
 }
 
-// 读取 ADC 引脚毫伏值：32 次采样，排序后去掉最高/最低各 6 个取平均
 uint32_t readRawPinMillivolts() {
   digitalWrite(VEXT_CTRL_PIN, LOW);
   delayMicroseconds(3000);
-  analogRead(VBAT_ADC_PIN); // 丢弃首帧
+  analogRead(VBAT_ADC_PIN);
 
   uint16_t s[32];
   for (int i = 0; i < 32; i++) {
     s[i] = analogRead(VBAT_ADC_PIN);
     delayMicroseconds(100);
   }
-  for (int i = 1; i < 32; i++) {          // 插入排序
+  for (int i = 1; i < 32; i++) {
     uint16_t k = s[i];
     int j = i - 1;
     while (j >= 0 && s[j] > k) { s[j + 1] = s[j]; j--; }
@@ -406,7 +441,6 @@ uint32_t readRawPinMillivolts() {
   return esp_adc_cal_raw_to_voltage(sum / 20, &adc_chars);
 }
 
-// 定时采样 + 慢速滤波
 void batteryTick(bool force) {
   unsigned long now = millis();
   if (!force && now - lastBatSampleMs < 500) return;
@@ -417,20 +451,18 @@ void batteryTick(bool force) {
 
   if (smoothedVbat <= 0.1f) {
     smoothedVbat = instant;
-  } else if (fabsf(instant - smoothedVbat) < 0.30f) {      // 剔除突变
+  } else if (fabsf(instant - smoothedVbat) < 0.30f) {
     smoothedVbat = smoothedVbat * 0.95f + instant * 0.05f;
   } else {
-    smoothedVbat = smoothedVbat * 0.99f + instant * 0.01f; // 大偏差时极慢跟随
+    smoothedVbat = smoothedVbat * 0.99f + instant * 0.01f;
   }
 }
 
-// 只返回已滤波的电压，不再每帧采样
 float readBatteryVoltage() {
   if (smoothedVbat <= 0.1f) batteryTick(true);
   return smoothedVbat;
 }
 
-// 电池电量百分比：每 4 秒最多变化 1%
 int getBatteryPercent(float vbat) {
   int calcPct;
   if (vbat >= 4.18f)      calcPct = 100;
@@ -451,7 +483,6 @@ int getBatteryPercent(float vbat) {
   return displayedBatPct;
 }
 
-// 绘制电池校准界面
 void drawCalibDisplay() {
   display.clearDisplay();
   display.setTextSize(1);
@@ -468,7 +499,6 @@ void drawCalibDisplay() {
   display.setCursor(0, 27);
   display.printf("Factor : %.4f", vbatCalFactor);
 
-  // 反显可调的目标测量值
   display.fillRect(0, 39, 128, 13, SSD1306_WHITE);
   display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
   display.setCursor(2, 42);
@@ -507,12 +537,10 @@ void drawMenuDisplay() {
   display.display();
 }
 
-// 频谱扫描与瀑布图优化逻辑
 void runSpectrumScan() {
   float step = (specEndFreq - specStartFreq) / SPEC_CHANNELS;
   float raw[SPEC_CHANNELS];
 
-  // 1. 逐通道扫描（增加稳定延时至 4.5ms，消隐滤波残余，避免通道间串扰）
   for (int i = 0; i < SPEC_CHANNELS; i++) {
     float freq = specStartFreq + (i + 0.5f) * step;
     LoRa.setFrequency(freq * 1E6);
@@ -521,13 +549,11 @@ void runSpectrumScan() {
     raw[i] = LoRa.rssi();
   }
 
-  // 2. 时间平滑（指数移动平均）
   for (int i = 0; i < SPEC_CHANNELS; i++) {
     specSmooth[i] = specInit ? (specSmooth[i] * 0.5f + raw[i] * 0.5f) : raw[i];
     specRssi[i] = specSmooth[i];
   }
 
-  // 3. 计算真实底噪（使用第 25% 低分位数，防止强信号抬高底噪）
   float tmp[SPEC_CHANNELS];
   memcpy(tmp, specRssi, sizeof(tmp));
   for (int i = 1; i < SPEC_CHANNELS; i++) {
@@ -540,7 +566,6 @@ void runSpectrumScan() {
   float currentFrameNoise = tmp[SPEC_CHANNELS / 4]; 
   minFoundRssi = tmp[0];
 
-  // 不对称底噪跟随：上升极慢（抗强信号拉高），下降快速（适应噪声降低）
   if (!specInit) {
     smoothedNoiseFloor = currentFrameNoise;
     displayedNoiseFloor = smoothedNoiseFloor;
@@ -558,7 +583,6 @@ void runSpectrumScan() {
     lastNoiseUpdateMs = millis();
   }
 
-  // 4. 寻找峰值
   maxFoundRssi = -160.0;
   for (int i = 0; i < SPEC_CHANNELS; i++) {
     if (specRssi[i] > maxFoundRssi) {
@@ -580,7 +604,6 @@ void runSpectrumScan() {
     displayedPeakValid = false;
   }
 
-  // 5. 瀑布图数据滚动与打点（使用自适应对比度门限）
   int wfLines = WATERFALL_H - 2;
   for (int y = wfLines - 1; y > 0; y--) {
     for (int x = 0; x < SPEC_CHANNELS; x++) {
@@ -588,17 +611,17 @@ void runSpectrumScan() {
     }
   }
 
-  const float WF_THRESH_LOW_ADJ  = 4.0f;  // 高于底噪 4dB 出灰点
-  const float WF_THRESH_HIGH_ADJ = 10.0f; // 高于底噪 10dB 出实点
+  const float WF_THRESH_LOW_ADJ  = 4.0f;
+  const float WF_THRESH_HIGH_ADJ = 10.0f;
 
   for (int x = 0; x < SPEC_CHANNELS; x++) {
     float delta = specRssi[x] - smoothedNoiseFloor;
     if (delta >= WF_THRESH_HIGH_ADJ) {
-      waterfallBuf[0][x] = 2; // 强信号：实心点
+      waterfallBuf[0][x] = 2;
     } else if (delta >= WF_THRESH_LOW_ADJ) {
-      waterfallBuf[0][x] = 1; // 弱信号：网格灰点
+      waterfallBuf[0][x] = 1;
     } else {
-      waterfallBuf[0][x] = 0; // 无信号：留白
+      waterfallBuf[0][x] = 0;
     }
   }
 }
@@ -608,7 +631,6 @@ void drawSpectrumDisplay() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  // 顶部峰值：频率 + 强度
   char topBuf[24];
   if (displayedPeakValid)
     snprintf(topBuf, sizeof(topBuf), "P:%.2f %.0fdBm", displayedPeakFreq, displayedPeakRssi);
@@ -631,7 +653,6 @@ void drawSpectrumDisplay() {
   int innerH = SPEC_BOX_H - 2;
   int colWidth = (SPEC_BOX_W - 2) / SPEC_CHANNELS;
 
-  // 柱状图下限以底噪为基准
   float lowRef = displayedNoiseFloor - 6.0f;
   if (lowRef > -45.0f) lowRef = -45.0f;
 
@@ -702,9 +723,29 @@ void drawMainDisplay() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  display.setCursor(0, 0);
-  display.printf("%.3fM", currentFreq);
+  // 1. 顶部左侧：显示频率及手动调频 UI
+  if (isFreqEditing) {
+    // 调频编辑模式下：绘制 6 个数位并对当前光标位置显示下划线
+    int xStart = 0;
+    int digitWidths[] = {0, 6, 12, 24, 30, 36}; // 对应 438.150 各数字偏移位置 (含小数点)
+    
+    char freqStr[12];
+    snprintf(freqStr, sizeof(freqStr), "%d%d%d.%d%d%dM", 
+             freqDigits[0], freqDigits[1], freqDigits[2], 
+             freqDigits[3], freqDigits[4], freqDigits[5]);
+    display.setCursor(0, 0);
+    display.print(freqStr);
 
+    // 绘制指示当前选中数位的下划线
+    int cursorX = digitWidths[digitCursor];
+    display.drawFastHLine(cursorX, 9, 5, SSD1306_WHITE);
+  } else {
+    // 正常显示当前频率
+    display.setCursor(0, 0);
+    display.printf("%.3fM", currentFreq);
+  }
+
+  // 2. 顶部右侧：电池电量
   float vbat = readBatteryVoltage();
   int pct = getBatteryPercent(vbat);
   char batStr[8];
@@ -713,6 +754,7 @@ void drawMainDisplay() {
   display.setCursor(batX, 0);
   display.print(batStr);
 
+  // 3. 中间数据框/波形图
   display.drawRect(BOX_X - 1, BOX_Y - 1, BOX_W + 2, BOX_H + 2, SSD1306_WHITE);
 
   if (isLocked) {
@@ -750,15 +792,22 @@ void drawMainDisplay() {
     }
   }
 
+  // 4. 底部栏提示
   int bottomY = 52;
   display.setCursor(0, bottomY);
-  display.printf("BW:%.0fK", signalBandwidth / 1000.0);
 
-  char sfCrBuf[16];
-  snprintf(sfCrBuf, sizeof(sfCrBuf), "SF%d/CR%d", COMBO_LIST[comboIdx].sf, COMBO_LIST[comboIdx].cr);
-  int xPos = SCREEN_WIDTH - (strlen(sfCrBuf) * 6);
-  display.setCursor(xPos, bottomY);
-  display.print(sfCrBuf);
+  if (isFreqEditing) {
+    // 调频状态下显示提示
+    display.print("1Click:Pos 2Click:+1");
+  } else {
+    display.printf("BW:%.0fK", signalBandwidth / 1000.0);
+
+    char sfCrBuf[16];
+    snprintf(sfCrBuf, sizeof(sfCrBuf), "SF%d/CR%d", COMBO_LIST[comboIdx].sf, COMBO_LIST[comboIdx].cr);
+    int xPos = SCREEN_WIDTH - (strlen(sfCrBuf) * 6);
+    display.setCursor(xPos, bottomY);
+    display.print(sfCrBuf);
+  }
 
   display.display();
 }
