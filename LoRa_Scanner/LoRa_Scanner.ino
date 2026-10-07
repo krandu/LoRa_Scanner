@@ -170,7 +170,7 @@ void floatToFreqDigits();
 void setup() {
   Serial.begin(115200);
   delay(100);
-  Serial.println("\n--- Heltec WiFi LoRa 32 V2 (Manual Freq Tuning) ---");
+  Serial.println("\n--- Heltec WiFi LoRa 32 V2 (Full Functional) ---");
 
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
@@ -223,7 +223,7 @@ void setup() {
   for (int i = 0; i < RSSI_HIST_LEN; i++) rssiHistory[i] = -120.0;
   memset(waterfallBuf, 0, sizeof(waterfallBuf));
 
-  floatToFreqDigits(); // 将初始频率转换为数位数组
+  floatToFreqDigits(); // 初始化数位数组
   lastActivityMs = millis();
 }
 
@@ -254,7 +254,6 @@ void applySpectrumBandwidth() {
   specInit = false;
 }
 
-// 辅助：将 currentFreq 转为数位数组
 void floatToFreqDigits() {
   long khz = round(currentFreq * 1000.0f);
   freqDigits[0] = (khz / 100000) % 10;
@@ -265,7 +264,6 @@ void floatToFreqDigits() {
   freqDigits[5] = khz % 10;
 }
 
-// 辅助：将数位数组转回 currentFreq 并限制合法范围
 void freqDigitsToFloat() {
   long khz = freqDigits[0] * 100000L +
              freqDigits[1] * 10000L +
@@ -276,7 +274,7 @@ void freqDigitsToFloat() {
   currentFreq = khz / 1000.0f;
   if (currentFreq < 410.0f) currentFreq = 410.0f;
   if (currentFreq > 525.0f) currentFreq = 525.0f;
-  floatToFreqDigits(); // 确保数值规整
+  floatToFreqDigits();
 }
 
 void loop() {
@@ -291,7 +289,7 @@ void loop() {
     lastActivityMs = millis();
   }
 
-  // 双击：未在编辑频率时，进入/退出主菜单
+  // 1. 最高优先级：非数字编辑模式下双击触发主菜单 (含瀑布图/LoRa接收模式)
   if (evt == DOUBLE_CLICK && !isFreqEditing) {
     if (inCalibUI) {
       inCalibUI = false;
@@ -302,7 +300,7 @@ void loop() {
     }
   }
 
-  // 1. 校准界面
+  // 2. 电池校准 UI
   if (inCalibUI) {
     if (evt == SINGLE_CLICK) {
       targetCalibVoltage += 0.05f;
@@ -320,7 +318,7 @@ void loop() {
     }
     drawCalibDisplay();
   }
-  // 2. 主菜单界面
+  // 3. 主菜单
   else if (inMenu) {
     if (evt == SINGLE_CLICK) {
       menuSelection = (menuSelection + 1) % MENU_ITEMS;
@@ -343,7 +341,7 @@ void loop() {
     }
     drawMenuDisplay();
   }
-  // 3. 频谱扫描模式
+  // 4. 频谱扫描/瀑布图模式
   else if (currentMode == MODE_SPECTRUM) {
     if (evt == SINGLE_CLICK) {
       specCenterFreq += 1.0;
@@ -359,39 +357,33 @@ void loop() {
     runSpectrumScan();
     drawSpectrumDisplay();
   }
-  // 4. LoRa 接收解码模式 (包含手动调频控制)
+  // 5. LoRa 分析解码接收模式
   else {
     if (isLocked) {
-      // 解码锁定状态下按键解锁
       if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
         isLocked = false;
         decodedPayload = "";
       }
     } 
-    // 手动调频编辑模式中
+    // 数位调整频率模式
     else if (isFreqEditing) {
       if (evt == SINGLE_CLICK) {
-        // 单击：移动输入光标到下一个数位
         digitCursor = (digitCursor + 1) % 6;
       } else if (evt == DOUBLE_CLICK) {
-        // 双击：当前数位 +1
         freqDigits[digitCursor] = (freqDigits[digitCursor] + 1) % 10;
-        freqDigitsToFloat(); // 更新计算
+        freqDigitsToFloat();
       } else if (evt == LONG_PRESS) {
-        // 长按：保存设置，退出编辑模式并应用新频率
         freqDigitsToFloat();
         applyLoRaConfig();
         isFreqEditing = false;
       }
     } 
-    // 正常 LoRa 接收监听状态
+    // 正常监听模式
     else {
       if (evt == SINGLE_CLICK) {
-        // 单击：切换 SF/CR 组合
         comboIdx = (comboIdx + 1) % COMBO_COUNT;
         applyLoRaConfig();
       } else if (evt == LONG_PRESS) {
-        // 长按：进入手动频率调整模式
         isFreqEditing = true;
         digitCursor = 0;
         floatToFreqDigits();
@@ -550,312 +542,4 @@ void runSpectrumScan() {
   }
 
   for (int i = 0; i < SPEC_CHANNELS; i++) {
-    specSmooth[i] = specInit ? (specSmooth[i] * 0.5f + raw[i] * 0.5f) : raw[i];
-    specRssi[i] = specSmooth[i];
-  }
-
-  float tmp[SPEC_CHANNELS];
-  memcpy(tmp, specRssi, sizeof(tmp));
-  for (int i = 1; i < SPEC_CHANNELS; i++) {
-    float k = tmp[i];
-    int j = i - 1;
-    while (j >= 0 && tmp[j] > k) { tmp[j + 1] = tmp[j]; j--; }
-    tmp[j + 1] = k;
-  }
-  
-  float currentFrameNoise = tmp[SPEC_CHANNELS / 4]; 
-  minFoundRssi = tmp[0];
-
-  if (!specInit) {
-    smoothedNoiseFloor = currentFrameNoise;
-    displayedNoiseFloor = smoothedNoiseFloor;
-    specInit = true;
-  } else {
-    if (currentFrameNoise < smoothedNoiseFloor) {
-      smoothedNoiseFloor = smoothedNoiseFloor * 0.7f + currentFrameNoise * 0.3f;
-    } else {
-      smoothedNoiseFloor = smoothedNoiseFloor * 0.98f + currentFrameNoise * 0.02f;
-    }
-  }
-
-  if (millis() - lastNoiseUpdateMs > NOISE_HOLD_TIME_MS) {
-    displayedNoiseFloor = smoothedNoiseFloor;
-    lastNoiseUpdateMs = millis();
-  }
-
-  maxFoundRssi = -160.0;
-  for (int i = 0; i < SPEC_CHANNELS; i++) {
-    if (specRssi[i] > maxFoundRssi) {
-      maxFoundRssi = specRssi[i];
-      rawPeakFreq = specStartFreq + (i + 0.5f) * step;
-    }
-  }
-  peakValid = (maxFoundRssi - smoothedNoiseFloor) >= PEAK_MIN_SNR;
-
-  if (peakValid) {
-    if (!displayedPeakValid || maxFoundRssi > displayedPeakRssi + 3.0f ||
-        millis() - lastPeakUpdateMs > 1500) {
-      displayedPeakFreq = rawPeakFreq;
-      displayedPeakRssi = maxFoundRssi;
-      displayedPeakValid = true;
-      lastPeakUpdateMs = millis();
-    }
-  } else if (millis() - lastPeakUpdateMs > 1500) {
-    displayedPeakValid = false;
-  }
-
-  int wfLines = WATERFALL_H - 2;
-  for (int y = wfLines - 1; y > 0; y--) {
-    for (int x = 0; x < SPEC_CHANNELS; x++) {
-      waterfallBuf[y][x] = waterfallBuf[y - 1][x];
-    }
-  }
-
-  const float WF_THRESH_LOW_ADJ  = 4.0f;
-  const float WF_THRESH_HIGH_ADJ = 10.0f;
-
-  for (int x = 0; x < SPEC_CHANNELS; x++) {
-    float delta = specRssi[x] - smoothedNoiseFloor;
-    if (delta >= WF_THRESH_HIGH_ADJ) {
-      waterfallBuf[0][x] = 2;
-    } else if (delta >= WF_THRESH_LOW_ADJ) {
-      waterfallBuf[0][x] = 1;
-    } else {
-      waterfallBuf[0][x] = 0;
-    }
-  }
-}
-
-void drawSpectrumDisplay() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  char topBuf[24];
-  if (displayedPeakValid)
-    snprintf(topBuf, sizeof(topBuf), "P:%.2f %.0fdBm", displayedPeakFreq, displayedPeakRssi);
-  else
-    snprintf(topBuf, sizeof(topBuf), "P:--.--");
-  display.setCursor(0, 0);
-  display.print(topBuf);
-
-  float vbat = readBatteryVoltage();
-  int pct = getBatteryPercent(vbat);
-  char batStr[8];
-  snprintf(batStr, sizeof(batStr), "%d%%", pct);
-  int batX = SCREEN_WIDTH - (strlen(batStr) * 6);
-  display.setCursor(batX, 0);
-  display.print(batStr);
-
-  display.drawRect(SPEC_BOX_X, SPEC_BOX_Y, SPEC_BOX_W, SPEC_BOX_H, SSD1306_WHITE);
-  int innerX = SPEC_BOX_X + 1;
-  int innerY = SPEC_BOX_Y + 1;
-  int innerH = SPEC_BOX_H - 2;
-  int colWidth = (SPEC_BOX_W - 2) / SPEC_CHANNELS;
-
-  float lowRef = displayedNoiseFloor - 6.0f;
-  if (lowRef > -45.0f) lowRef = -45.0f;
-
-  for (int i = 0; i < SPEC_CHANNELS; i++) {
-    int lineH = map((int)constrain(specRssi[i], lowRef, -30.0f), (int)lowRef, -30, 1, innerH);
-    int xPos = innerX + i * colWidth;
-    if (lineH > 0) {
-      display.fillRect(xPos, innerY + innerH - lineH, colWidth - 1, lineH, SSD1306_WHITE);
-    }
-  }
-
-  char noiseBuf[12];
-  snprintf(noiseBuf, sizeof(noiseBuf), "NF:%.0f", displayedNoiseFloor);
-  int noiseTextW = strlen(noiseBuf) * 6;
-  int noiseBoxX = (SPEC_BOX_X + SPEC_BOX_W) - noiseTextW - 3;
-
-  display.fillRect(noiseBoxX - 1, SPEC_BOX_Y + 2, noiseTextW + 2, 9, SSD1306_BLACK);
-  display.setCursor(noiseBoxX, SPEC_BOX_Y + 3);
-  display.print(noiseBuf);
-
-  display.drawRect(WATERFALL_X, WATERFALL_Y, WATERFALL_W, WATERFALL_H, SSD1306_WHITE);
-  int wfInnerX = WATERFALL_X + 1;
-  int wfInnerY = WATERFALL_Y + 1;
-  int wfLines = WATERFALL_H - 2;
-
-  for (int y = 0; y < wfLines; y++) {
-    for (int i = 0; i < SPEC_CHANNELS; i++) {
-      int xPos = wfInnerX + i * colWidth;
-      uint8_t val = waterfallBuf[y][i];
-      if (val == 2) {
-        display.fillRect(xPos, wfInnerY + y, colWidth - 1, 1, SSD1306_WHITE);
-      } else if (val == 1) {
-        if ((i + y) % 2 == 0) {
-          display.drawPixel(xPos, wfInnerY + y, SSD1306_WHITE);
-        }
-      }
-    }
-  }
-
-  display.setCursor(0, 56);
-  display.printf("C:%.1fM", specCenterFreq);
-
-  display.setCursor(56, 56);
-  display.printf("S:%.0fM", spanOptions[spanIdx].spanMHz);
-
-  display.setCursor(94, 56);
-  display.printf("K:%.0fk", spanOptions[spanIdx].stepkHz);
-
-  display.display();
-}
-
-void applyLoRaConfig() {
-  LoRa.setFrequency(currentFreq * 1E6);
-  LoRa.setSignalBandwidth(signalBandwidth);
-  LoRa.setSpreadingFactor(COMBO_LIST[comboIdx].sf);
-  LoRa.setCodingRate4(COMBO_LIST[comboIdx].cr);
-  LoRa.receive();
-}
-
-void sampleRSSI() {
-  float rawRssi = LoRa.rssi();
-  rssiHistory[rssiWrIdx] = rawRssi;
-  rssiWrIdx = (rssiWrIdx + 1) % RSSI_HIST_LEN;
-}
-
-void drawMainDisplay() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  // 1. 顶部左侧：显示频率及手动调频 UI
-  if (isFreqEditing) {
-    // 调频编辑模式下：绘制 6 个数位并对当前光标位置显示下划线
-    int xStart = 0;
-    int digitWidths[] = {0, 6, 12, 24, 30, 36}; // 对应 438.150 各数字偏移位置 (含小数点)
-    
-    char freqStr[12];
-    snprintf(freqStr, sizeof(freqStr), "%d%d%d.%d%d%dM", 
-             freqDigits[0], freqDigits[1], freqDigits[2], 
-             freqDigits[3], freqDigits[4], freqDigits[5]);
-    display.setCursor(0, 0);
-    display.print(freqStr);
-
-    // 绘制指示当前选中数位的下划线
-    int cursorX = digitWidths[digitCursor];
-    display.drawFastHLine(cursorX, 9, 5, SSD1306_WHITE);
-  } else {
-    // 正常显示当前频率
-    display.setCursor(0, 0);
-    display.printf("%.3fM", currentFreq);
-  }
-
-  // 2. 顶部右侧：电池电量
-  float vbat = readBatteryVoltage();
-  int pct = getBatteryPercent(vbat);
-  char batStr[8];
-  snprintf(batStr, sizeof(batStr), "%d%%", pct);
-  int batX = SCREEN_WIDTH - (strlen(batStr) * 6);
-  display.setCursor(batX, 0);
-  display.print(batStr);
-
-  // 3. 中间数据框/波形图
-  display.drawRect(BOX_X - 1, BOX_Y - 1, BOX_W + 2, BOX_H + 2, SSD1306_WHITE);
-
-  if (isLocked) {
-    display.setTextWrap(false);
-    String line1 = "", line2 = "";
-    if (decodedPayload.length() <= 17) {
-      line1 = decodedPayload;
-    } else {
-      line1 = decodedPayload.substring(0, 17);
-      line2 = (decodedPayload.length() > 32) ? (decodedPayload.substring(17, 31) + "...") : decodedPayload.substring(17);
-    }
-    display.setCursor(BOX_X + 2, BOX_Y + 2);
-    display.print(line1.length() > 0 ? line1 : "<EMPTY>");
-    if (line2.length() > 0) {
-      display.setCursor(BOX_X + 2, BOX_Y + 11);
-      display.print(line2);
-    }
-    display.setCursor(BOX_X + 2, BOX_Y + 22);
-    display.printf("R:%ddBm S:%.1fdB", lastPacketRssi, lastPacketSnr);
-  } else {
-    display.setTextWrap(false);
-    float minRssi = 0.0;
-    for (int i = 0; i < RSSI_HIST_LEN; i++) {
-      if (rssiHistory[i] < minRssi) minRssi = rssiHistory[i];
-    }
-    if (minRssi > -60.0) minRssi = -120.0;
-
-    for (int col = 0; col < BOX_W; col++) {
-      int idx = (rssiWrIdx + col) % RSSI_HIST_LEN;
-      float val = rssiHistory[idx];
-      int lineH = map((int)constrain(val, minRssi, -30.0), (int)minRssi, -30, 0, BOX_H - 1);
-      if (lineH > 0) {
-        display.drawFastVLine(BOX_X + col, BOX_Y + BOX_H - lineH, lineH, SSD1306_WHITE);
-      }
-    }
-  }
-
-  // 4. 底部栏提示
-  int bottomY = 52;
-  display.setCursor(0, bottomY);
-
-  if (isFreqEditing) {
-    // 调频状态下显示提示
-    display.print("1Click:Pos 2Click:+1");
-  } else {
-    display.printf("BW:%.0fK", signalBandwidth / 1000.0);
-
-    char sfCrBuf[16];
-    snprintf(sfCrBuf, sizeof(sfCrBuf), "SF%d/CR%d", COMBO_LIST[comboIdx].sf, COMBO_LIST[comboIdx].cr);
-    int xPos = SCREEN_WIDTH - (strlen(sfCrBuf) * 6);
-    display.setCursor(xPos, bottomY);
-    display.print(sfCrBuf);
-  }
-
-  display.display();
-}
-
-void powerOff() {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setCursor(25, 28);
-  display.println(F("POWERING OFF..."));
-  display.display();
-  delay(1000);
-
-  display.clearDisplay();
-  display.display();
-
-  digitalWrite(VEXT_CTRL_PIN, HIGH);
-  esp_deep_sleep_start();
-}
-
-BtnEvent checkButton() {
-  bool currentState = digitalRead(PRG_BUTTON_PIN);
-  unsigned long now = millis();
-  BtnEvent event = NONE;
-
-  if (lastBtnState == HIGH && currentState == LOW) {
-    btnPressTime = now;
-  } else if (lastBtnState == LOW && currentState == HIGH) {
-    unsigned long pressDuration = now - btnPressTime;
-
-    if (pressDuration >= 1200) {
-      event = LONG_PRESS;
-      isWaitingForClick = false;
-    } else if (pressDuration > 50) {
-      if (isWaitingForClick && (now - lastReleaseTime < 350)) {
-        event = DOUBLE_CLICK;
-        isWaitingForClick = false;
-      } else {
-        isWaitingForClick = true;
-      }
-      lastReleaseTime = now;
-    }
-  }
-
-  if (isWaitingForClick && (now - lastReleaseTime >= 350)) {
-    event = SINGLE_CLICK;
-    isWaitingForClick = false;
-  }
-
-  lastBtnState = currentState;
-  return event;
-}
+    specSmooth[i] = specInit
