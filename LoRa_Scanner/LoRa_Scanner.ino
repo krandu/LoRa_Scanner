@@ -256,22 +256,3 @@ void applySpectrumBandwidth() {
 }
 
 void floatToFreqDigits() {
-  long khz = round(currentFreq * 1000.0f);
-  freqDigits[0] = (khz / 100000) % 10;
-  freqDigits[1] = (khz / 10000) % 10;
-  freqDigits[2] = (khz / 1000) % 10;
-  freqDigits[3] = (khz / 100) % 10;
-  freqDigits[4] = (khz / 10) % 10;
-  freqDigits[5] = khz % 10;
-}
-
-void freqDigitsToFloat() {
-  long khz = freqDigits[0] * 100000L +
-             freqDigits[1] * 10000L +
-             freqDigits[2] * 1000L +
-             freqDigits[3] * 100L +
-             freqDigits[4] * 10L +
-             freqDigits[5];
-  currentFreq = khz / 1000.0f;
-  if (currentFreq < 410.0f) currentFreq = 410.0f;
-  if (currentFreq > 525.0f) currentFreq = 525.0f
