@@ -256,3 +256,121 @@ void applySpectrumBandwidth() {
 }
 
 void floatToFreqDigits() {
+  long khz = round(currentFreq * 1000.0f);
+  freqDigits[0] = (khz / 100000) % 10;
+  freqDigits[1] = (khz / 10000) % 10;
+  freqDigits[2] = (khz / 1000) % 10;
+  freqDigits[3] = (khz / 100) % 10;
+  freqDigits[4] = (khz / 10) % 10;
+  freqDigits[5] = khz % 10;
+}
+
+void freqDigitsToFloat() {
+  long khz = freqDigits[0] * 100000L +
+             freqDigits[1] * 10000L +
+             freqDigits[2] * 1000L +
+             freqDigits[3] * 100L +
+             freqDigits[4] * 10L +
+             freqDigits[5];
+  currentFreq = khz / 1000.0f;
+  if (currentFreq < 410.0f) currentFreq = 410.0f;
+  if (currentFreq > 525.0f) currentFreq = 525.0f;
+}
+
+void loop() {
+  batteryTick(false);
+
+  if (millis() - lastActivityMs > AUTO_POWER_OFF_MS) {
+    powerOff();
+  }
+
+  BtnEvent evt = checkButton();
+  if (evt != NONE) {
+    lastActivityMs = millis();
+  }
+
+  if (evt == DOUBLE_CLICK && !isFreqEditing) {
+    if (inCalibUI) {
+      inCalibUI = false;
+      inMenu = true;
+    } else {
+      inMenu = !inMenu;
+      if (inMenu) menuSelection = (currentMode == MODE_SPECTRUM) ? 0 : 1;
+    }
+  }
+
+  if (inCalibUI) {
+    if (evt == SINGLE_CLICK) {
+      targetCalibVoltage += 0.05f;
+      if (targetCalibVoltage > 4.25f) targetCalibVoltage = 3.30f;
+    } else if (evt == LONG_PRESS) {
+      uint32_t pinmV = readRawPinMillivolts();
+      if (pinmV > 0) {
+        float newFactor = (targetCalibVoltage * 1000.0f) / (float)pinmV;
+        saveCalibFactor(newFactor);
+        smoothedVbat = 0.0f;
+        batteryTick(true);
+      }
+      inCalibUI = false;
+      inMenu = false;
+    }
+    drawCalibDisplay();
+  }
+  else if (inMenu) {
+    if (evt == SINGLE_CLICK) {
+      menuSelection = (menuSelection + 1) % MENU_ITEMS;
+    } else if (evt == LONG_PRESS) {
+      if (menuSelection == 0) {
+        currentMode = MODE_SPECTRUM;
+        applySpectrumBandwidth();
+        inMenu = false;
+      } else if (menuSelection == 1) {
+        currentMode = MODE_LORA_ANALYZER;
+        applyLoRaConfig();
+        inMenu = false;
+      } else if (menuSelection == 2) {
+        inCalibUI = true;
+        targetCalibVoltage = readBatteryVoltage();
+        if (targetCalibVoltage < 3.3f) targetCalibVoltage = 3.80f;
+      } else if (menuSelection == 3) {
+        powerOff();
+      }
+    }
+    drawMenuDisplay();
+  }
+  else if (currentMode == MODE_SPECTRUM) {
+    if (evt == SINGLE_CLICK) {
+      specCenterFreq += 1.0;
+      if (specCenterFreq > 439.0) specCenterFreq = 431.0;
+      updateSpanFreqs();
+      specInit = false;
+    } else if (evt == LONG_PRESS) {
+      spanIdx = (spanIdx + 1) % SPAN_COUNT;
+      updateSpanFreqs();
+      applySpectrumBandwidth();
+    }
+
+    runSpectrumScan();
+    drawSpectrumDisplay();
+  }
+  else {
+    if (isLocked) {
+      if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
+        isLocked = false;
+        decodedPayload = "";
+      }
+    } 
+    else if (isFreqEditing) {
+      if (evt == SINGLE_CLICK) {
+        digitCursor = (digitCursor + 1) % 6;
+      } else if (evt == DOUBLE_CLICK) {
+        freqDigits[digitCursor] = (freqDigits[digitCursor] + 1) % 10;
+        freqDigitsToFloat();
+      } else if (evt == LONG_PRESS) {
+        freqDigitsToFloat();
+        applyLoRaConfig();
+        isFreqEditing = false;
+      }
+    } 
+    else {
+      if (evt == SINGLE_CLICK)
