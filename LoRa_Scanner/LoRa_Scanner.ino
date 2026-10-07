@@ -79,8 +79,6 @@ bool  specInit = false;           // 参数变化后重新初始化平滑缓冲
 bool  peakValid = false;
 bool  displayedPeakValid = false;
 
-const float WF_THRESH_LOW  = 6.0;   // 高出底噪 6dB 画灰点
-const float WF_THRESH_HIGH = 15.0;  // 高出底噪 15dB 画实点
 const float PEAK_MIN_SNR   = 8.0;   // 峰值有效门限
 
 // 峰值防抖相关变量
@@ -509,26 +507,27 @@ void drawMenuDisplay() {
   display.display();
 }
 
-// 频谱扫描逻辑
+// 频谱扫描与瀑布图优化逻辑
 void runSpectrumScan() {
   float step = (specEndFreq - specStartFreq) / SPEC_CHANNELS;
   float raw[SPEC_CHANNELS];
 
+  // 1. 逐通道扫描（增加稳定延时至 4.5ms，消隐滤波残余，避免通道间串扰）
   for (int i = 0; i < SPEC_CHANNELS; i++) {
-    float freq = specStartFreq + (i + 0.5f) * step;   // 取通道中心
+    float freq = specStartFreq + (i + 0.5f) * step;
     LoRa.setFrequency(freq * 1E6);
     LoRa.receive();
-    delayMicroseconds(2500);                          // 留足 RSSI 稳定时间
+    delayMicroseconds(4500); 
     raw[i] = LoRa.rssi();
   }
 
-  // 1) 每通道时间平滑，抑制毛刺
+  // 2. 时间平滑（指数移动平均）
   for (int i = 0; i < SPEC_CHANNELS; i++) {
-    specSmooth[i] = specInit ? (specSmooth[i] * 0.6f + raw[i] * 0.4f) : raw[i];
+    specSmooth[i] = specInit ? (specSmooth[i] * 0.5f + raw[i] * 0.5f) : raw[i];
     specRssi[i] = specSmooth[i];
   }
 
-  // 2) 中位数作为底噪（不受信号影响）
+  // 3. 计算真实底噪（使用第 25% 低分位数，防止强信号抬高底噪）
   float tmp[SPEC_CHANNELS];
   memcpy(tmp, specRssi, sizeof(tmp));
   for (int i = 1; i < SPEC_CHANNELS; i++) {
@@ -537,12 +536,21 @@ void runSpectrumScan() {
     while (j >= 0 && tmp[j] > k) { tmp[j + 1] = tmp[j]; j--; }
     tmp[j + 1] = k;
   }
-  float median = tmp[SPEC_CHANNELS / 2];
+  
+  float currentFrameNoise = tmp[SPEC_CHANNELS / 4]; 
   minFoundRssi = tmp[0];
-  smoothedNoiseFloor = specInit ? (smoothedNoiseFloor * 0.85f + median * 0.15f) : median;
+
+  // 不对称底噪跟随：上升极慢（抗强信号拉高），下降快速（适应噪声降低）
   if (!specInit) {
+    smoothedNoiseFloor = currentFrameNoise;
     displayedNoiseFloor = smoothedNoiseFloor;
     specInit = true;
+  } else {
+    if (currentFrameNoise < smoothedNoiseFloor) {
+      smoothedNoiseFloor = smoothedNoiseFloor * 0.7f + currentFrameNoise * 0.3f;
+    } else {
+      smoothedNoiseFloor = smoothedNoiseFloor * 0.98f + currentFrameNoise * 0.02f;
+    }
   }
 
   if (millis() - lastNoiseUpdateMs > NOISE_HOLD_TIME_MS) {
@@ -550,7 +558,7 @@ void runSpectrumScan() {
     lastNoiseUpdateMs = millis();
   }
 
-  // 3) 峰值：必须高出底噪 PEAK_MIN_SNR 才有效
+  // 4. 寻找峰值
   maxFoundRssi = -160.0;
   for (int i = 0; i < SPEC_CHANNELS; i++) {
     if (specRssi[i] > maxFoundRssi) {
@@ -569,20 +577,29 @@ void runSpectrumScan() {
       lastPeakUpdateMs = millis();
     }
   } else if (millis() - lastPeakUpdateMs > 1500) {
-    displayedPeakValid = false;   // 信号消失后 1.5s 清除
+    displayedPeakValid = false;
   }
 
-  // 4) 瀑布图：以底噪为基准，而不是以最低点为基准
+  // 5. 瀑布图数据滚动与打点（使用自适应对比度门限）
   int wfLines = WATERFALL_H - 2;
-  for (int y = wfLines - 1; y > 0; y--)
-    for (int x = 0; x < SPEC_CHANNELS; x++)
+  for (int y = wfLines - 1; y > 0; y--) {
+    for (int x = 0; x < SPEC_CHANNELS; x++) {
       waterfallBuf[y][x] = waterfallBuf[y - 1][x];
+    }
+  }
+
+  const float WF_THRESH_LOW_ADJ  = 4.0f;  // 高于底噪 4dB 出灰点
+  const float WF_THRESH_HIGH_ADJ = 10.0f; // 高于底噪 10dB 出实点
 
   for (int x = 0; x < SPEC_CHANNELS; x++) {
     float delta = specRssi[x] - smoothedNoiseFloor;
-    if (delta > WF_THRESH_HIGH)     waterfallBuf[0][x] = 2;
-    else if (delta > WF_THRESH_LOW) waterfallBuf[0][x] = 1;
-    else                            waterfallBuf[0][x] = 0;
+    if (delta >= WF_THRESH_HIGH_ADJ) {
+      waterfallBuf[0][x] = 2; // 强信号：实心点
+    } else if (delta >= WF_THRESH_LOW_ADJ) {
+      waterfallBuf[0][x] = 1; // 弱信号：网格灰点
+    } else {
+      waterfallBuf[0][x] = 0; // 无信号：留白
+    }
   }
 }
 
@@ -616,7 +633,7 @@ void drawSpectrumDisplay() {
 
   // 柱状图下限以底噪为基准
   float lowRef = displayedNoiseFloor - 6.0f;
-  if (lowRef > -45.0f) lowRef = -45.0f;   // 防止范围过小
+  if (lowRef > -45.0f) lowRef = -45.0f;
 
   for (int i = 0; i < SPEC_CHANNELS; i++) {
     int lineH = map((int)constrain(specRssi[i], lowRef, -30.0f), (int)lowRef, -30, 1, innerH);
