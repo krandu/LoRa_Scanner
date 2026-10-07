@@ -14,7 +14,7 @@
 #define VEXT_CTRL_PIN 21   // 控制屏幕及电池分压电路供电 (LOW 为激活)
 #define OLED_SDA      4
 #define OLED_SCL      15
-#define OLED_RST      16 
+#define OLED_RST      16
 #define VBAT_ADC_PIN  37   // Heltec V2 板载电池采样引脚 (ADC1_CH1)
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RST);
@@ -28,7 +28,7 @@ esp_adc_cal_characteristics_t adc_chars;
 #define RST_PIN   14
 #define DIO0_PIN  26
 
-#define PRG_BUTTON_PIN 0 
+#define PRG_BUTTON_PIN 0
 
 // ================= NVS 闪存校准参数 =================
 float vbatCalFactor = 4.90f; // 默认分压校准系数
@@ -39,7 +39,7 @@ unsigned long lastActivityMs = 0;
 
 // ================= 模式与状态 =================
 enum SystemMode { MODE_SPECTRUM, MODE_LORA_ANALYZER };
-SystemMode currentMode = MODE_SPECTRUM; 
+SystemMode currentMode = MODE_SPECTRUM;
 
 // 跨度/步进结构
 struct SpectrumSpanOption {
@@ -55,10 +55,10 @@ const int SPAN_COUNT = sizeof(spanOptions) / sizeof(spanOptions[0]);
 int spanIdx = 0;
 
 // 中心频率与扫描范围控制
-float specCenterFreq = 435.0; 
+float specCenterFreq = 435.0;
 float specStartFreq  = 430.0;
 float specEndFreq    = 440.0;
-#define SPEC_CHANNELS    40     
+#define SPEC_CHANNELS    40
 
 #define SPEC_BOX_X       3
 #define SPEC_BOX_Y       11
@@ -71,7 +71,17 @@ float specEndFreq    = 440.0;
 #define WATERFALL_H      20
 
 float specRssi[SPEC_CHANNELS];
-uint8_t waterfallBuf[WATERFALL_H - 2][SPEC_CHANNELS]; 
+uint8_t waterfallBuf[WATERFALL_H - 2][SPEC_CHANNELS];
+
+// ===== 频谱平滑与门限 =====
+float specSmooth[SPEC_CHANNELS];
+bool  specInit = false;           // 参数变化后重新初始化平滑缓冲
+bool  peakValid = false;
+bool  displayedPeakValid = false;
+
+const float WF_THRESH_LOW  = 6.0;   // 高出底噪 6dB 画灰点
+const float WF_THRESH_HIGH = 15.0;  // 高出底噪 15dB 画实点
+const float PEAK_MIN_SNR   = 8.0;   // 峰值有效门限
 
 // 峰值防抖相关变量
 float rawPeakRssi = -160.0;
@@ -84,24 +94,24 @@ unsigned long lastPeakUpdateMs = 0;
 float smoothedNoiseFloor = -100.0;
 float displayedNoiseFloor = -100.0;
 unsigned long lastNoiseUpdateMs = 0;
-const unsigned long NOISE_HOLD_TIME_MS = 1500; 
+const unsigned long NOISE_HOLD_TIME_MS = 1500;
 
 float maxFoundRssi = -160.0;
-float minFoundRssi = 0.0; 
+float minFoundRssi = 0.0;
 
 // LoRa 分析模式变量
-const float FREQ_LIST[] = { 438.150, 438.125, 438.000, 438.500 }; 
+const float FREQ_LIST[] = { 438.150, 438.125, 438.000, 438.500 };
 const int FREQ_COUNT = sizeof(FREQ_LIST) / sizeof(FREQ_LIST[0]);
 int freqIdx = 0;
 float currentFreq = FREQ_LIST[0];
-long signalBandwidth = 125E3; 
+long signalBandwidth = 125E3;
 
 struct LoRaCombo { uint8_t sf; uint8_t cr; };
 const LoRaCombo COMBO_LIST[] = {
   {12, 5}, {7, 5}, {8, 5}, {9, 5}, {10, 5}, {11, 5}, {7, 8}, {12, 8}
 };
 const int COMBO_COUNT = sizeof(COMBO_LIST) / sizeof(COMBO_LIST[0]);
-int comboIdx = 0; 
+int comboIdx = 0;
 
 #define BOX_X 8
 #define BOX_Y 12
@@ -121,6 +131,8 @@ float lastPacketSnr = 0.0;
 // 电池滤波平滑变量
 float smoothedVbat = 0.0;
 int displayedBatPct = -1;
+unsigned long lastBatSampleMs = 0;
+unsigned long lastBatPctMs = 0;
 
 // 按键与菜单
 enum BtnEvent { NONE, SINGLE_CLICK, DOUBLE_CLICK, LONG_PRESS };
@@ -131,13 +143,14 @@ bool isWaitingForClick = false;
 
 bool inMenu = false;
 bool inCalibUI = false;
-int menuSelection = 0; 
+int menuSelection = 0;
 const int MENU_ITEMS = 4; // 1.Spectrum 2.LoRa 3.Calib Bat 4.Power Off
 
 float targetCalibVoltage = 3.80f; // 万用表测量参考电压设定值
 
 // 函数声明
 void applyLoRaConfig();
+void applySpectrumBandwidth();
 void runSpectrumScan();
 void sampleRSSI();
 void drawMainDisplay();
@@ -145,6 +158,7 @@ void drawSpectrumDisplay();
 void drawMenuDisplay();
 void drawCalibDisplay();
 BtnEvent checkButton();
+void batteryTick(bool force);
 float readBatteryVoltage();
 uint32_t readRawPinMillivolts();
 int getBatteryPercent(float vbat);
@@ -162,7 +176,7 @@ void setup() {
 
   // 开启 VEXT (低电平开启屏幕及分压测量电路供电)
   pinMode(VEXT_CTRL_PIN, OUTPUT);
-  digitalWrite(VEXT_CTRL_PIN, LOW); 
+  digitalWrite(VEXT_CTRL_PIN, LOW);
   delay(50);
 
   // 初始化 OLED 复位引脚
@@ -192,6 +206,7 @@ void setup() {
 
   // 读取 Flash 保存的校准参数
   loadCalibFactor();
+  batteryTick(true);   // 初始化电池读数
 
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
@@ -206,7 +221,8 @@ void setup() {
     display.display();
     while (1);
   }
-  
+
+  applySpectrumBandwidth();   // 频谱模式按步进选择接收带宽
   LoRa.receive();
   for (int i = 0; i < RSSI_HIST_LEN; i++) rssiHistory[i] = -120.0;
   memset(waterfallBuf, 0, sizeof(waterfallBuf));
@@ -237,7 +253,18 @@ void updateSpanFreqs() {
   specEndFreq   = specCenterFreq + halfSpan;
 }
 
+// 根据步进自动选择扫描带宽，避免漏扫/串扰
+void applySpectrumBandwidth() {
+  float k = spanOptions[spanIdx].stepkHz;
+  long bw = (k >= 250) ? 250E3 : (k >= 125) ? 125E3 : 41.7E3;
+  LoRa.setSignalBandwidth(bw);
+  LoRa.receive();
+  specInit = false;
+}
+
 void loop() {
+  batteryTick(false);   // 每 500ms 采样一次
+
   // 1. 自动关机检测
   if (millis() - lastActivityMs > AUTO_POWER_OFF_MS) {
     powerOff();
@@ -273,6 +300,7 @@ void loop() {
         float newFactor = (targetCalibVoltage * 1000.0f) / (float)pinmV;
         saveCalibFactor(newFactor);
         smoothedVbat = 0.0f; // 重置滤波缓冲
+        batteryTick(true);
       }
       inCalibUI = false;
       inMenu = false;
@@ -286,6 +314,7 @@ void loop() {
     } else if (evt == LONG_PRESS) {
       if (menuSelection == 0) {
         currentMode = MODE_SPECTRUM;
+        applySpectrumBandwidth();
         inMenu = false;
       } else if (menuSelection == 1) {
         currentMode = MODE_LORA_ANALYZER;
@@ -300,21 +329,23 @@ void loop() {
       }
     }
     drawMenuDisplay();
-  } 
+  }
   // 5. 频谱扫描模式
   else if (currentMode == MODE_SPECTRUM) {
     if (evt == SINGLE_CLICK) {
       specCenterFreq += 1.0;
       if (specCenterFreq > 439.0) specCenterFreq = 431.0;
       updateSpanFreqs();
+      specInit = false;
     } else if (evt == LONG_PRESS) {
       spanIdx = (spanIdx + 1) % SPAN_COUNT;
       updateSpanFreqs();
+      applySpectrumBandwidth();
     }
 
     runSpectrumScan();
     drawSpectrumDisplay();
-  } 
+  }
   // 6. LoRa 分析模式
   else {
     if (isLocked) {
@@ -342,7 +373,7 @@ void loop() {
     if (packetSize) {
       String incoming = "";
       while (LoRa.available()) incoming += (char)LoRa.read();
-      
+
       isLocked = true;
       int aprsMsgIdx = incoming.indexOf("::");
       decodedPayload = (aprsMsgIdx != -1) ? incoming.substring(aprsMsgIdx + 2) : incoming;
@@ -355,57 +386,69 @@ void loop() {
   }
 }
 
-// 读取 ADC 原始引脚毫伏值 (含 32次采样)
+// 读取 ADC 引脚毫伏值：32 次采样，排序后去掉最高/最低各 6 个取平均
 uint32_t readRawPinMillivolts() {
   digitalWrite(VEXT_CTRL_PIN, LOW);
   delayMicroseconds(3000);
-
   analogRead(VBAT_ADC_PIN); // 丢弃首帧
 
-  uint32_t rawSum = 0;
+  uint16_t s[32];
   for (int i = 0; i < 32; i++) {
-    rawSum += analogRead(VBAT_ADC_PIN);
+    s[i] = analogRead(VBAT_ADC_PIN);
     delayMicroseconds(100);
   }
-  uint32_t rawAvg = rawSum / 32;
-
-  return esp_adc_cal_raw_to_voltage(rawAvg, &adc_chars);
+  for (int i = 1; i < 32; i++) {          // 插入排序
+    uint16_t k = s[i];
+    int j = i - 1;
+    while (j >= 0 && s[j] > k) { s[j + 1] = s[j]; j--; }
+    s[j + 1] = k;
+  }
+  uint32_t sum = 0;
+  for (int i = 6; i < 26; i++) sum += s[i];
+  return esp_adc_cal_raw_to_voltage(sum / 20, &adc_chars);
 }
 
-// 基于 NVS 动态校准系数读取电压
-float readBatteryVoltage() {
+// 定时采样 + 慢速滤波
+void batteryTick(bool force) {
+  unsigned long now = millis();
+  if (!force && now - lastBatSampleMs < 500) return;
+  lastBatSampleMs = now;
+
   uint32_t pinmV = readRawPinMillivolts();
-  float instantVbat = ((float)pinmV * vbatCalFactor) / 1000.0f;
+  float instant = ((float)pinmV * vbatCalFactor) / 1000.0f;
 
   if (smoothedVbat <= 0.1f) {
-    smoothedVbat = instantVbat;
+    smoothedVbat = instant;
+  } else if (fabsf(instant - smoothedVbat) < 0.30f) {      // 剔除突变
+    smoothedVbat = smoothedVbat * 0.95f + instant * 0.05f;
   } else {
-    smoothedVbat = (smoothedVbat * 0.90f) + (instantVbat * 0.10f);
+    smoothedVbat = smoothedVbat * 0.99f + instant * 0.01f; // 大偏差时极慢跟随
   }
+}
 
+// 只返回已滤波的电压，不再每帧采样
+float readBatteryVoltage() {
+  if (smoothedVbat <= 0.1f) batteryTick(true);
   return smoothedVbat;
 }
 
-// 电池电量百分比计算
+// 电池电量百分比：每 4 秒最多变化 1%
 int getBatteryPercent(float vbat) {
-  int calcPct = 0;
-
-  if (vbat >= 4.18f) {
-    calcPct = 100;
-  } else if (vbat >= 3.82f) {
-    calcPct = 65 + (int)((vbat - 3.82f) / (4.18f - 3.82f) * 35.0f);
-  } else if (vbat >= 3.60f) {
-    calcPct = 20 + (int)((vbat - 3.60f) / (3.82f - 3.60f) * 45.0f);
-  } else if (vbat >= 3.30f) {
-    calcPct = 0 + (int)((vbat - 3.30f) / (3.60f - 3.30f) * 20.0f);
-  } else {
-    calcPct = 0;
-  }
-
+  int calcPct;
+  if (vbat >= 4.18f)      calcPct = 100;
+  else if (vbat >= 3.82f) calcPct = 65 + (int)((vbat - 3.82f) / (4.18f - 3.82f) * 35.0f);
+  else if (vbat >= 3.60f) calcPct = 20 + (int)((vbat - 3.60f) / (3.82f - 3.60f) * 45.0f);
+  else if (vbat >= 3.30f) calcPct = (int)((vbat - 3.30f) / (3.60f - 3.30f) * 20.0f);
+  else                    calcPct = 0;
   calcPct = constrain(calcPct, 0, 100);
 
-  if (displayedBatPct == -1 || abs(calcPct - displayedBatPct) >= 2) {
+  unsigned long now = millis();
+  if (displayedBatPct == -1) {
     displayedBatPct = calcPct;
+    lastBatPctMs = now;
+  } else if (now - lastBatPctMs >= 4000 && calcPct != displayedBatPct) {
+    displayedBatPct += (calcPct > displayedBatPct) ? 1 : -1;
+    lastBatPctMs = now;
   }
   return displayedBatPct;
 }
@@ -442,7 +485,7 @@ void drawCalibDisplay() {
 
 void drawMenuDisplay() {
   display.clearDisplay();
-  
+
   display.setTextSize(1);
   display.setCursor(20, 0);
   display.println("= SELECT MODE =");
@@ -469,55 +512,77 @@ void drawMenuDisplay() {
 // 频谱扫描逻辑
 void runSpectrumScan() {
   float step = (specEndFreq - specStartFreq) / SPEC_CHANNELS;
-  maxFoundRssi = -160.0;
-  minFoundRssi = 0.0;
-  float rssiSum = 0.0;
+  float raw[SPEC_CHANNELS];
 
   for (int i = 0; i < SPEC_CHANNELS; i++) {
-    float freq = specStartFreq + i * step;
+    float freq = specStartFreq + (i + 0.5f) * step;   // 取通道中心
     LoRa.setFrequency(freq * 1E6);
-    LoRa.receive(); 
-    delayMicroseconds(1800); 
-    
-    float val = LoRa.rssi();
-    specRssi[i] = val;
-    rssiSum += val;
-
-    if (val > maxFoundRssi) {
-      maxFoundRssi = val;
-      rawPeakFreq = freq;
-    }
-    if (val < minFoundRssi) {
-      minFoundRssi = val;
-    }
+    LoRa.receive();
+    delayMicroseconds(2500);                          // 留足 RSSI 稳定时间
+    raw[i] = LoRa.rssi();
   }
 
-  float instantAvgNoise = rssiSum / SPEC_CHANNELS;
-  smoothedNoiseFloor = (smoothedNoiseFloor * 0.85) + (instantAvgNoise * 0.15);
-  
+  // 1) 每通道时间平滑，抑制毛刺
+  for (int i = 0; i < SPEC_CHANNELS; i++) {
+    specSmooth[i] = specInit ? (specSmooth[i] * 0.6f + raw[i] * 0.4f) : raw[i];
+    specRssi[i] = specSmooth[i];
+  }
+
+  // 2) 中位数作为底噪（不受信号影响）
+  float tmp[SPEC_CHANNELS];
+  memcpy(tmp, specRssi, sizeof(tmp));
+  for (int i = 1; i < SPEC_CHANNELS; i++) {
+    float k = tmp[i];
+    int j = i - 1;
+    while (j >= 0 && tmp[j] > k) { tmp[j + 1] = tmp[j]; j--; }
+    tmp[j + 1] = k;
+  }
+  float median = tmp[SPEC_CHANNELS / 2];
+  minFoundRssi = tmp[0];
+  smoothedNoiseFloor = specInit ? (smoothedNoiseFloor * 0.85f + median * 0.15f) : median;
+  if (!specInit) {
+    displayedNoiseFloor = smoothedNoiseFloor;
+    specInit = true;
+  }
+
   if (millis() - lastNoiseUpdateMs > NOISE_HOLD_TIME_MS) {
     displayedNoiseFloor = smoothedNoiseFloor;
     lastNoiseUpdateMs = millis();
   }
 
-  if ((maxFoundRssi > displayedPeakRssi + 3.0) || (millis() - lastPeakUpdateMs > 1500)) {
-    displayedPeakFreq = rawPeakFreq;
-    displayedPeakRssi = maxFoundRssi;
-    lastPeakUpdateMs = millis();
-  }
-
-  int wfLines = WATERFALL_H - 2;
-  for (int y = wfLines - 1; y > 0; y--) {
-    for (int x = 0; x < SPEC_CHANNELS; x++) {
-      waterfallBuf[y][x] = waterfallBuf[y - 1][x];
+  // 3) 峰值：必须高出底噪 PEAK_MIN_SNR 才有效
+  maxFoundRssi = -160.0;
+  for (int i = 0; i < SPEC_CHANNELS; i++) {
+    if (specRssi[i] > maxFoundRssi) {
+      maxFoundRssi = specRssi[i];
+      rawPeakFreq = specStartFreq + (i + 0.5f) * step;
     }
   }
+  peakValid = (maxFoundRssi - smoothedNoiseFloor) >= PEAK_MIN_SNR;
+
+  if (peakValid) {
+    if (!displayedPeakValid || maxFoundRssi > displayedPeakRssi + 3.0f ||
+        millis() - lastPeakUpdateMs > 1500) {
+      displayedPeakFreq = rawPeakFreq;
+      displayedPeakRssi = maxFoundRssi;
+      displayedPeakValid = true;
+      lastPeakUpdateMs = millis();
+    }
+  } else if (millis() - lastPeakUpdateMs > 1500) {
+    displayedPeakValid = false;   // 信号消失后 1.5s 清除
+  }
+
+  // 4) 瀑布图：以底噪为基准，而不是以最低点为基准
+  int wfLines = WATERFALL_H - 2;
+  for (int y = wfLines - 1; y > 0; y--)
+    for (int x = 0; x < SPEC_CHANNELS; x++)
+      waterfallBuf[y][x] = waterfallBuf[y - 1][x];
 
   for (int x = 0; x < SPEC_CHANNELS; x++) {
-    float delta = specRssi[x] - minFoundRssi;
-    if (delta > 20.0)      waterfallBuf[0][x] = 2; 
-    else if (delta > 8.0)  waterfallBuf[0][x] = 1; 
-    else                   waterfallBuf[0][x] = 0; 
+    float delta = specRssi[x] - smoothedNoiseFloor;
+    if (delta > WF_THRESH_HIGH)     waterfallBuf[0][x] = 2;
+    else if (delta > WF_THRESH_LOW) waterfallBuf[0][x] = 1;
+    else                            waterfallBuf[0][x] = 0;
   }
 }
 
@@ -526,8 +591,12 @@ void drawSpectrumDisplay() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  char topBuf[16];
-  snprintf(topBuf, sizeof(topBuf), "P:%.2f", displayedPeakFreq);
+  // 顶部峰值：频率 + 强度
+  char topBuf[24];
+  if (displayedPeakValid)
+    snprintf(topBuf, sizeof(topBuf), "P:%.2f %.0fdBm", displayedPeakFreq, displayedPeakRssi);
+  else
+    snprintf(topBuf, sizeof(topBuf), "P:--.--");
   display.setCursor(0, 0);
   display.print(topBuf);
 
@@ -543,10 +612,14 @@ void drawSpectrumDisplay() {
   int innerX = SPEC_BOX_X + 1;
   int innerY = SPEC_BOX_Y + 1;
   int innerH = SPEC_BOX_H - 2;
-  int colWidth = (SPEC_BOX_W - 2) / SPEC_CHANNELS; 
+  int colWidth = (SPEC_BOX_W - 2) / SPEC_CHANNELS;
+
+  // 柱状图下限以底噪为基准
+  float lowRef = displayedNoiseFloor - 6.0f;
+  if (lowRef > -45.0f) lowRef = -45.0f;   // 防止范围过小
 
   for (int i = 0; i < SPEC_CHANNELS; i++) {
-    int lineH = map((int)constrain(specRssi[i], minFoundRssi, -30.0), (int)minFoundRssi, -30, 1, innerH);
+    int lineH = map((int)constrain(specRssi[i], lowRef, -30.0f), (int)lowRef, -30, 1, innerH);
     int xPos = innerX + i * colWidth;
     if (lineH > 0) {
       display.fillRect(xPos, innerY + innerH - lineH, colWidth - 1, lineH, SSD1306_WHITE);
@@ -557,7 +630,7 @@ void drawSpectrumDisplay() {
   snprintf(noiseBuf, sizeof(noiseBuf), "NF:%.0f", displayedNoiseFloor);
   int noiseTextW = strlen(noiseBuf) * 6;
   int noiseBoxX = (SPEC_BOX_X + SPEC_BOX_W) - noiseTextW - 3;
-  
+
   display.fillRect(noiseBoxX - 1, SPEC_BOX_Y + 2, noiseTextW + 2, 9, SSD1306_BLACK);
   display.setCursor(noiseBoxX, SPEC_BOX_Y + 3);
   display.print(noiseBuf);
@@ -583,11 +656,11 @@ void drawSpectrumDisplay() {
 
   display.setCursor(0, 56);
   display.printf("C:%.1fM", specCenterFreq);
-  
+
   display.setCursor(56, 56);
   display.printf("S:%.0fM", spanOptions[spanIdx].spanMHz);
 
-  display.setCursor(94, 56); 
+  display.setCursor(94, 56);
   display.printf("K:%.0fk", spanOptions[spanIdx].stepkHz);
 
   display.display();
@@ -602,7 +675,7 @@ void applyLoRaConfig() {
 }
 
 void sampleRSSI() {
-  float rawRssi = LoRa.rssi(); 
+  float rawRssi = LoRa.rssi();
   rssiHistory[rssiWrIdx] = rawRssi;
   rssiWrIdx = (rssiWrIdx + 1) % RSSI_HIST_LEN;
 }
@@ -614,7 +687,7 @@ void drawMainDisplay() {
 
   display.setCursor(0, 0);
   display.printf("%.3fM", currentFreq);
-  
+
   float vbat = readBatteryVoltage();
   int pct = getBatteryPercent(vbat);
   char batStr[8];
@@ -697,7 +770,7 @@ BtnEvent checkButton() {
     btnPressTime = now;
   } else if (lastBtnState == LOW && currentState == HIGH) {
     unsigned long pressDuration = now - btnPressTime;
-    
+
     if (pressDuration >= 1200) {
       event = LONG_PRESS;
       isWaitingForClick = false;
