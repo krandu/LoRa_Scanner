@@ -148,7 +148,23 @@ QueueHandle_t btnQueue = NULL;                  // 按键事件队列（由独�
 bool inMenu = false;
 bool inCalibUI = false;
 int menuSelection = 0;
-const int MENU_ITEMS = 4; // 1.Spectrum 2.LoRa 3.Calib Bat 4.Power Off
+const int MENU_ITEMS = 5; // 1.Spectrum 2.LoRa 3.Set Freq 4.Calib Bat 5.Power Off
+
+// ===== 手动设置频率界面 =====
+bool inFreqUI = false;
+int  freqEditPos = 0;                       // 0~5 = 六位数字，6 = 保存
+int  freqDigits[6] = {4, 3, 8, 1, 5, 0};    // 438.150 MHz
+const uint32_t FREQ_MIN_KHZ = 410000;       // SX1278 433 频段下限
+const uint32_t FREQ_MAX_KHZ = 525000;       // SX1278 433 频段上限
+
+// ===== 设置自动保存 =====
+bool settingsDirty = false;
+unsigned long settingsDirtyMs = 0;
+const unsigned long SETTINGS_SAVE_DELAY_MS = 3000;  // 参数变化后 3 秒无操作再写入 Flash
+
+// ===== LoRa 模式实时信号强度 =====
+float liveRssi = -120.0;
+bool  liveRssiInit = false;
 
 float targetCalibVoltage = 3.80f; // 万用表测量参考电压设定值
 
@@ -163,6 +179,12 @@ void drawMenuDisplay();
 void drawCalibDisplay();
 BtnEvent checkButton();
 void buttonTask(void* param);
+void loadSettings();
+void saveSettings();
+void markSettingsDirty();
+void openFreqEditor();
+void commitFreq();
+void drawFreqEditDisplay();
 void batteryTick(bool force);
 float readBatteryVoltage();
 uint32_t readRawPinMillivolts();
@@ -216,6 +238,7 @@ void setup() {
   // 读取 Flash 保存的校准参数
   loadCalibFactor();
   batteryTick(true);   // 初始化电池读数
+  loadSettings();      // 读取上次保存的模式和参数
 
   SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
   LoRa.setPins(SS_PIN, RST_PIN, DIO0_PIN);
@@ -231,7 +254,11 @@ void setup() {
     while (1);
   }
 
-  applySpectrumBandwidth();   // 频谱模式按步进选择接收带宽
+  if (currentMode == MODE_SPECTRUM) {
+    applySpectrumBandwidth();   // 频谱模式按步进选择接收带宽
+  } else {
+    applyLoRaConfig();          // 恢复上次的 LoRa 接收参数
+  }
   LoRa.receive();
   for (int i = 0; i < RSSI_HIST_LEN; i++) rssiHistory[i] = -120.0;
   memset(waterfallBuf, 0, sizeof(waterfallBuf));
@@ -274,20 +301,25 @@ void applySpectrumBandwidth() {
 void loop() {
   batteryTick(false);   // 每 500ms 采样一次
 
+  // 设置自动保存：参数变化后延时写入，减少 Flash 擦写
+  if (settingsDirty && millis() - settingsDirtyMs > SETTINGS_SAVE_DELAY_MS) {
+    saveSettings();
+  }
+
   // 1. 自动关机检测
   if (millis() - lastActivityMs > AUTO_POWER_OFF_MS) {
     powerOff();
   }
 
-  // 2. 检测按键事件
+  // 2. 取按键事件（由按键任务产生）
   BtnEvent evt = NONE;
-  xQueueReceive(btnQueue, &evt, 0);   // 取出按键任务产生的事件
+  xQueueReceive(btnQueue, &evt, 0);
   if (evt != NONE) {
     lastActivityMs = millis();
   }
 
-  // 双击随时进入/退出主菜单
-  if (evt == DOUBLE_CLICK) {
+  // 双击随时进入/退出主菜单（频率设置界面里双击用于数字 -1，不在此处理）
+  if (evt == DOUBLE_CLICK && !inFreqUI) {
     if (inCalibUI) {
       inCalibUI = false;
       inMenu = true;
@@ -297,8 +329,28 @@ void loop() {
     }
   }
 
-  // 3. 校准界面交互
-  if (inCalibUI) {
+  // 3. 频率设置界面
+  if (inFreqUI) {
+    if (evt == SINGLE_CLICK) {
+      if (freqEditPos < 6) {
+        freqDigits[freqEditPos] = (freqDigits[freqEditPos] + 1) % 10;
+      } else {
+        commitFreq();                 // 保存并应用
+      }
+    } else if (evt == DOUBLE_CLICK) {
+      if (freqEditPos < 6) {
+        freqDigits[freqEditPos] = (freqDigits[freqEditPos] + 9) % 10;
+      } else {
+        inFreqUI = false;             // 放弃修改，回到菜单
+        inMenu = true;
+      }
+    } else if (evt == LONG_PRESS) {
+      freqEditPos = (freqEditPos + 1) % 7;   // 下一位，最后一位之后是"保存"
+    }
+    if (inFreqUI) drawFreqEditDisplay(); else drawMenuDisplay();
+  }
+  // 4. 校准界面交互
+  else if (inCalibUI) {
     if (evt == SINGLE_CLICK) {
       // 步进切换万用表测量值 (+0.05V，循环 3.30V ~ 4.25V)
       targetCalibVoltage += 0.05f;
@@ -317,7 +369,7 @@ void loop() {
     }
     drawCalibDisplay();
   }
-  // 4. 菜单控制
+  // 5. 菜单控制
   else if (inMenu) {
     if (evt == SINGLE_CLICK) {
       menuSelection = (menuSelection + 1) % MENU_ITEMS;
@@ -326,37 +378,45 @@ void loop() {
         currentMode = MODE_SPECTRUM;
         applySpectrumBandwidth();
         inMenu = false;
+        markSettingsDirty();
       } else if (menuSelection == 1) {
         currentMode = MODE_LORA_ANALYZER;
         applyLoRaConfig();
         inMenu = false;
+        markSettingsDirty();
       } else if (menuSelection == 2) {
+        openFreqEditor();            // 手动设置 LoRa 接收频率
+      } else if (menuSelection == 3) {
         inCalibUI = true; // 进入电池校准模式
         targetCalibVoltage = readBatteryVoltage(); // 以当前测得电压为基准
         if (targetCalibVoltage < 3.3f) targetCalibVoltage = 3.80f;
-      } else if (menuSelection == 3) {
+      } else if (menuSelection == 4) {
         powerOff();
       }
     }
-    drawMenuDisplay();
+    if (inFreqUI) drawFreqEditDisplay();
+    else if (inCalibUI) drawCalibDisplay();
+    else drawMenuDisplay();
   }
-  // 5. 频谱扫描模式
+  // 6. 频谱扫描模式
   else if (currentMode == MODE_SPECTRUM) {
     if (evt == SINGLE_CLICK) {
       specCenterFreq += 1.0;
       if (specCenterFreq > 439.0) specCenterFreq = 431.0;
       updateSpanFreqs();
       specInit = false;
+      markSettingsDirty();
     } else if (evt == LONG_PRESS) {
       spanIdx = (spanIdx + 1) % SPAN_COUNT;
       updateSpanFreqs();
       applySpectrumBandwidth();
+      markSettingsDirty();
     }
 
     runSpectrumScan();
     drawSpectrumDisplay();
   }
-  // 6. LoRa 分析模式
+  // 7. LoRa 分析模式
   else {
     if (isLocked) {
       if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
@@ -367,10 +427,12 @@ void loop() {
       if (evt == SINGLE_CLICK) {
         comboIdx = (comboIdx + 1) % COMBO_COUNT;
         applyLoRaConfig();
+        markSettingsDirty();
       } else if (evt == LONG_PRESS) {
         freqIdx = (freqIdx + 1) % FREQ_COUNT;
         currentFreq = FREQ_LIST[freqIdx];
         applyLoRaConfig();
+        markSettingsDirty();
       }
     }
 
@@ -501,17 +563,17 @@ void drawMenuDisplay() {
   display.println("= SELECT MODE =");
   display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
 
-  const char* items[] = {"1. Spectrum Scan", "2. LoRa Receiver", "3. Calib Battery", "4. Power Off"};
+  const char* items[] = {"1. Spectrum Scan", "2. LoRa Receiver", "3. Set LoRa Freq", "4. Calib Battery", "5. Power Off"};
 
   for (int i = 0; i < MENU_ITEMS; i++) {
-    int yPos = 13 + i * 12;
+    int yPos = 12 + i * 10;
     if (menuSelection == i) {
-      display.fillRect(5, yPos, 118, 11, SSD1306_WHITE);
+      display.fillRect(5, yPos, 118, 10, SSD1306_WHITE);
       display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
     } else {
       display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
     }
-    display.setCursor(8, yPos + 2);
+    display.setCursor(8, yPos + 1);
     display.println(items[i]);
   }
 
@@ -677,6 +739,7 @@ void drawSpectrumDisplay() {
 }
 
 void applyLoRaConfig() {
+  liveRssiInit = false;   // 切换频率/参数后重新计算实时信号强度
   LoRa.setFrequency(currentFreq * 1E6);
   LoRa.setSignalBandwidth(signalBandwidth);
   LoRa.setSpreadingFactor(COMBO_LIST[comboIdx].sf);
@@ -686,6 +749,12 @@ void applyLoRaConfig() {
 
 void sampleRSSI() {
   float rawRssi = LoRa.rssi();
+  if (!liveRssiInit) {
+    liveRssi = rawRssi;
+    liveRssiInit = true;
+  } else {
+    liveRssi = liveRssi * 0.7f + rawRssi * 0.3f;   // 轻度平滑
+  }
   rssiHistory[rssiWrIdx] = rawRssi;
   rssiWrIdx = (rssiWrIdx + 1) % RSSI_HIST_LEN;
 }
@@ -697,6 +766,10 @@ void drawMainDisplay() {
 
   display.setCursor(0, 0);
   display.printf("%.3fM", currentFreq);
+
+  // 实时信号强度（顶部中间）
+  display.setCursor(54, 0);
+  display.printf("%.0fdBm", liveRssi);
 
   float vbat = readBatteryVoltage();
   int pct = getBatteryPercent(vbat);
@@ -757,6 +830,7 @@ void drawMainDisplay() {
 }
 
 void powerOff() {
+  if (settingsDirty) saveSettings();
   display.clearDisplay();
   display.setTextSize(1);
   display.setCursor(25, 28);
@@ -819,4 +893,136 @@ BtnEvent checkButton() {
 
   lastBtnState = currentState;
   return event;
+}
+
+// ================= 设置保存 / 读取 =================
+void markSettingsDirty() {
+  settingsDirty = true;
+  settingsDirtyMs = millis();
+}
+
+void saveSettings() {
+  prefs.begin("settings", false);
+  prefs.putUChar("mode", (uint8_t)currentMode);
+  prefs.putUChar("span", (uint8_t)spanIdx);
+  prefs.putFloat("cen", specCenterFreq);
+  prefs.putUInt("fkhz", (uint32_t)lroundf(currentFreq * 1000.0f));
+  prefs.putUChar("combo", (uint8_t)comboIdx);
+  prefs.putUChar("fidx", (uint8_t)freqIdx);
+  prefs.end();
+  settingsDirty = false;
+  Serial.printf("[NVS] Settings saved: mode=%d span=%d cen=%.1f freq=%.3f combo=%d\n",
+                (int)currentMode, spanIdx, specCenterFreq, currentFreq, comboIdx);
+}
+
+void loadSettings() {
+  prefs.begin("settings", false);   // 读写模式打开，首次运行会自动创建命名空间
+  uint8_t mode  = prefs.getUChar("mode", (uint8_t)MODE_SPECTRUM);
+  uint8_t span  = prefs.getUChar("span", 0);
+  float   cen   = prefs.getFloat("cen", 435.0f);
+  uint32_t fkhz = prefs.getUInt("fkhz", (uint32_t)lroundf(FREQ_LIST[0] * 1000.0f));
+  uint8_t combo = prefs.getUChar("combo", 0);
+  uint8_t fidx  = prefs.getUChar("fidx", 0);
+  prefs.end();
+
+  // 合法性检查，避免 Flash 中的异常值导致越界
+  currentMode  = (mode == (uint8_t)MODE_LORA_ANALYZER) ? MODE_LORA_ANALYZER : MODE_SPECTRUM;
+  spanIdx      = (span < SPAN_COUNT) ? span : 0;
+  specCenterFreq = (cen >= 431.0f && cen <= 439.0f) ? cen : 435.0f;
+  if (fkhz < FREQ_MIN_KHZ || fkhz > FREQ_MAX_KHZ) fkhz = (uint32_t)lroundf(FREQ_LIST[0] * 1000.0f);
+  currentFreq  = fkhz / 1000.0f;
+  comboIdx     = (combo < COMBO_COUNT) ? combo : 0;
+  freqIdx      = (fidx < FREQ_COUNT) ? fidx : 0;
+
+  Serial.printf("[NVS] Settings loaded: mode=%d span=%d cen=%.1f freq=%.3f combo=%d\n",
+                (int)currentMode, spanIdx, specCenterFreq, currentFreq, comboIdx);
+}
+
+// ================= 手动设置频率 =================
+void openFreqEditor() {
+  uint32_t khz = (uint32_t)lroundf(currentFreq * 1000.0f);
+  freqDigits[0] = (khz / 100000) % 10;
+  freqDigits[1] = (khz / 10000) % 10;
+  freqDigits[2] = (khz / 1000) % 10;
+  freqDigits[3] = (khz / 100) % 10;
+  freqDigits[4] = (khz / 10) % 10;
+  freqDigits[5] = khz % 10;
+  freqEditPos = 0;
+  inFreqUI = true;
+  inMenu = false;
+}
+
+static uint32_t freqDigitsToKHz() {
+  return (uint32_t)freqDigits[0] * 100000UL + (uint32_t)freqDigits[1] * 10000UL +
+         (uint32_t)freqDigits[2] * 1000UL   + (uint32_t)freqDigits[3] * 100UL +
+         (uint32_t)freqDigits[4] * 10UL     + (uint32_t)freqDigits[5];
+}
+
+void commitFreq() {
+  uint32_t khz = freqDigitsToKHz();
+  if (khz < FREQ_MIN_KHZ) khz = FREQ_MIN_KHZ;
+  if (khz > FREQ_MAX_KHZ) khz = FREQ_MAX_KHZ;
+
+  currentFreq = khz / 1000.0f;
+  currentMode = MODE_LORA_ANALYZER;
+  isLocked = false;
+  decodedPayload = "";
+  for (int i = 0; i < RSSI_HIST_LEN; i++) rssiHistory[i] = -120.0;
+  applyLoRaConfig();
+  markSettingsDirty();
+
+  inFreqUI = false;
+  inMenu = false;
+}
+
+void drawFreqEditDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+
+  display.setCursor(10, 0);
+  display.print("= SET LORA FREQ =");
+  display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+
+  // 大号频率显示  XXX.XXX
+  char buf[10];
+  snprintf(buf, sizeof(buf), "%d%d%d.%d%d%d",
+           freqDigits[0], freqDigits[1], freqDigits[2],
+           freqDigits[3], freqDigits[4], freqDigits[5]);
+  display.setTextSize(2);
+  display.setCursor(8, 15);
+  display.print(buf);
+  display.setTextSize(1);
+  display.setCursor(96, 22);
+  display.print("MHz");
+
+  // 当前编辑位的下划线（字符位置 0,1,2,4,5,6，每字符宽 12px）
+  if (freqEditPos < 6) {
+    static const uint8_t charPos[6] = {0, 1, 2, 4, 5, 6};
+    display.fillRect(8 + charPos[freqEditPos] * 12, 32, 11, 2, SSD1306_WHITE);
+  }
+
+  // 范围提示
+  uint32_t khz = freqDigitsToKHz();
+  display.setCursor(0, 37);
+  if (khz < FREQ_MIN_KHZ || khz > FREQ_MAX_KHZ) display.print("OUT OF RANGE>clamp");
+  else display.print("Range 410-525MHz");
+
+  // 保存行
+  if (freqEditPos == 6) {
+    display.fillRect(0, 46, 128, 10, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.setCursor(2, 47);
+    display.print("> SAVE & APPLY <");
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    display.setCursor(0, 56);
+    display.print("Click:Save 2xClk:Esc");
+  } else {
+    display.setCursor(0, 47);
+    display.print("Hold: next digit");
+    display.setCursor(0, 56);
+    display.print("Click:+1  2xClk:-1");
+  }
+
+  display.display();
 }
