@@ -1,1 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Heltec LoRa Spectrum 在线刷机</title>
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, "Microsoft YaHei", sans-serif; max-width: 640px; margin: 40px auto; padding: 0 16px; line-height: 1.6; }
+    h1 { font-size: 1.4rem; }
+    .box { border: 1px solid #8884; border-radius: 12px; padding: 16px 20px; margin: 20px 0; }
+    code { background: #8882; padding: 1px 6px; border-radius: 4px; }
+    #ver { font-family: monospace; }
+  </style>
+</head>
+<body>
+  <h1>Heltec WiFi LoRa 32 V2 在线刷机</h1>
 
+  <div class="box">
+    <p>当前固件版本：<span id="ver">读取中…</span></p>
+    <esp-web-install-button manifest="manifest.json">
+      <span slot="unsupported">当前浏览器不支持 Web Serial，请使用桌面版 Chrome 或 Edge。</span>
+      <span slot="not-allowed">请通过 https 地址打开本页面。</span>
+    </esp-web-install-button>
+  </div>
+
+  <div class="box">
+    <p><b>使用方法</b></p>
+    <ol>
+      <li>用数据线连接设备，使用桌面版 Chrome 或 Edge 打开本页。</li>
+      <li>点击上面的按钮，在弹窗里选择设备的串口，然后点安装。</li>
+      <li>如果连接或写入失败：按住板上的 <code>PRG</code> 键，再按一下 <code>RST</code> 键后松开，然后重试。</li>
+      <li>刷完后设备会自动重启。已保存的电池校准和预设频率不会被清除。</li>
+    </ol>
+  </div>
+
+  <script>
+    fetch("version.txt", { cache: "no-store" })
+      .then(r => r.text())
+      .then(t => { document.getElementById("ver").textContent = t.trim(); })
+      .catch(() => { document.getElementById("ver").textContent = "未知"; });
+  </script>
+</body>
+</html>
