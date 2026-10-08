@@ -30,6 +30,8 @@ esp_adc_cal_characteristics_t adc_chars;
 
 #define PRG_BUTTON_PIN 0
 
+#define FW_VERSION "v4-presets"   // 开机画面显示，用于确认刷入的是新固件
+
 // ================= NVS 闪存校准参数 =================
 float vbatCalFactor = 4.90f; // 默认分压校准系数
 
@@ -100,10 +102,14 @@ float maxFoundRssi = -160.0;
 float minFoundRssi = 0.0;
 
 // LoRa 分析模式变量
-const float FREQ_LIST[] = { 438.150, 438.125, 438.000, 438.500 };
-const int FREQ_COUNT = sizeof(FREQ_LIST) / sizeof(FREQ_LIST[0]);
+// 预设频率表（可在"Freq Presets"菜单中增删改，保存在 Flash）
+#define MAX_PRESETS 8
+const uint32_t DEFAULT_PRESETS_KHZ[] = { 438150, 438125, 438000, 438500 };
+const int DEFAULT_PRESET_COUNT = sizeof(DEFAULT_PRESETS_KHZ) / sizeof(DEFAULT_PRESETS_KHZ[0]);
+uint32_t presetKHz[MAX_PRESETS] = { 438150, 438125, 438000, 438500 };
+int presetCount = DEFAULT_PRESET_COUNT;
 int freqIdx = 0;
-float currentFreq = FREQ_LIST[0];
+float currentFreq = 438.150;
 long signalBandwidth = 125E3;
 
 struct LoRaCombo { uint8_t sf; uint8_t cr; };
@@ -148,7 +154,7 @@ QueueHandle_t btnQueue = NULL;                  // 按键事件队列（由独�
 bool inMenu = false;
 bool inCalibUI = false;
 int menuSelection = 0;
-const int MENU_ITEMS = 5; // 1.Spectrum 2.LoRa 3.Set Freq 4.Calib Bat 5.Power Off
+const int MENU_ITEMS = 5; // 1.Spectrum 2.LoRa 3.Freq Presets 4.Calib Bat 5.Power Off
 
 // ===== 手动设置频率界面 =====
 bool inFreqUI = false;
@@ -156,6 +162,13 @@ int  freqEditPos = 0;                       // 0~5 = 六位数字，6 = 保存
 int  freqDigits[6] = {4, 3, 8, 1, 5, 0};    // 438.150 MHz
 const uint32_t FREQ_MIN_KHZ = 410000;       // SX1278 433 频段下限
 const uint32_t FREQ_MAX_KHZ = 525000;       // SX1278 433 频段上限
+int  freqEditTarget = -2;                   // -2=手动设置并直接应用, -1=新建预设, >=0=编辑该预设
+
+// ===== 预设频率管理界面 =====
+bool inPresetUI = false;
+int  presetPage = 0;      // 0=预设列表, 1=操作菜单
+int  presetSel = 0;       // 列表选中项：0..presetCount-1 为预设，presetCount 为"新建"，presetCount+1 为"手动频率"
+int  presetActSel = 0;    // 操作菜单：0 使用 1 编辑 2 删除 3 返回
 
 // ===== 设置自动保存 =====
 bool settingsDirty = false;
@@ -182,9 +195,13 @@ void buttonTask(void* param);
 void loadSettings();
 void saveSettings();
 void markSettingsDirty();
-void openFreqEditor();
+void savePresets();
+void openPresetManager();
+void openFreqEditor(int target, uint32_t startKHz);
+void applyFreqAndEnterLoRa(uint32_t khz);
 void commitFreq();
 void drawFreqEditDisplay();
+void drawPresetDisplay();
 void batteryTick(bool force);
 float readBatteryVoltage();
 uint32_t readRawPinMillivolts();
@@ -198,6 +215,7 @@ void setup() {
   Serial.begin(115200);
   delay(100);
   Serial.println("\n--- Heltec WiFi LoRa 32 V2 (Auto Calib) ---");
+  Serial.println("FW " FW_VERSION);
 
   pinMode(PRG_BUTTON_PIN, INPUT_PULLUP);
 
@@ -227,6 +245,8 @@ void setup() {
   display.setTextSize(1);
   display.setCursor(20, 25);
   display.println(F("Initializing..."));
+  display.setCursor(32, 40);
+  display.println(F(FW_VERSION));
   display.display();
 
   // 配置 ESP32 ADC1 & 工厂 eFuse 校准
@@ -318,9 +338,17 @@ void loop() {
     lastActivityMs = millis();
   }
 
-  // 双击随时进入/退出主菜单（频率设置界面里双击用于数字 -1，不在此处理）
+  // 双击：返回上一级 / 进入或退出主菜单（频率编辑界面里双击用于数字 -1，不在此处理）
   if (evt == DOUBLE_CLICK && !inFreqUI) {
-    if (inCalibUI) {
+    if (inPresetUI) {
+      if (presetPage == 1) {
+        presetPage = 0;              // 操作菜单 -> 列表
+      } else {
+        inPresetUI = false;          // 列表 -> 主菜单
+        inMenu = true;
+        menuSelection = 2;
+      }
+    } else if (inCalibUI) {
       inCalibUI = false;
       inMenu = true;
     } else {
@@ -329,27 +357,75 @@ void loop() {
     }
   }
 
-  // 3. 频率设置界面
+  // 3. 频率编辑界面
   if (inFreqUI) {
     if (evt == SINGLE_CLICK) {
       if (freqEditPos < 6) {
         freqDigits[freqEditPos] = (freqDigits[freqEditPos] + 1) % 10;
       } else {
-        commitFreq();                 // 保存并应用
+        commitFreq();                 // 保存
       }
     } else if (evt == DOUBLE_CLICK) {
       if (freqEditPos < 6) {
         freqDigits[freqEditPos] = (freqDigits[freqEditPos] + 9) % 10;
       } else {
-        inFreqUI = false;             // 放弃修改，回到菜单
-        inMenu = true;
+        inFreqUI = false;             // 放弃修改
+        if (!inPresetUI) inMenu = true;
       }
     } else if (evt == LONG_PRESS) {
       freqEditPos = (freqEditPos + 1) % 7;   // 下一位，最后一位之后是"保存"
     }
-    if (inFreqUI) drawFreqEditDisplay(); else drawMenuDisplay();
+    if (inFreqUI) drawFreqEditDisplay();
+    else if (inPresetUI) drawPresetDisplay();
+    else if (inMenu) drawMenuDisplay();
   }
-  // 4. 校准界面交互
+  // 4. 预设频率管理界面
+  else if (inPresetUI) {
+    int total = presetCount + 2;      // 预设 + 新建 + 手动频率
+    if (presetPage == 0) {
+      if (evt == SINGLE_CLICK) {
+        presetSel = (presetSel + 1) % total;
+      } else if (evt == LONG_PRESS) {
+        uint32_t curKHz = (uint32_t)lroundf(currentFreq * 1000.0f);
+        if (presetSel < presetCount) {
+          presetPage = 1;             // 打开该预设的操作菜单
+          presetActSel = 0;
+        } else if (presetSel == presetCount) {
+          if (presetCount < MAX_PRESETS) openFreqEditor(-1, curKHz);   // 新建预设
+        } else {
+          openFreqEditor(-2, curKHz);                                  // 手动频率，直接应用
+        }
+      }
+    } else {
+      if (evt == SINGLE_CLICK) {
+        presetActSel = (presetActSel + 1) % 4;
+      } else if (evt == LONG_PRESS) {
+        if (presetActSel == 0) {                       // 使用
+          freqIdx = presetSel;
+          applyFreqAndEnterLoRa(presetKHz[presetSel]);
+        } else if (presetActSel == 1) {                // 编辑
+          openFreqEditor(presetSel, presetKHz[presetSel]);
+        } else if (presetActSel == 2) {                // 删除（至少保留 1 个）
+          if (presetCount > 1) {
+            for (int i = presetSel; i < presetCount - 1; i++) presetKHz[i] = presetKHz[i + 1];
+            presetCount--;
+            if (freqIdx > presetSel) freqIdx--;
+            else if (freqIdx == presetSel) freqIdx = 0;
+            if (freqIdx >= presetCount) freqIdx = 0;
+            if (presetSel >= presetCount) presetSel = presetCount - 1;
+            savePresets();
+            markSettingsDirty();
+          }
+          presetPage = 0;
+        } else {                                       // 返回
+          presetPage = 0;
+        }
+      }
+    }
+    if (inPresetUI) drawPresetDisplay();
+    else if (inMenu) drawMenuDisplay();
+  }
+  // 5. 校准界面交互
   else if (inCalibUI) {
     if (evt == SINGLE_CLICK) {
       // 步进切换万用表测量值 (+0.05V，循环 3.30V ~ 4.25V)
@@ -369,7 +445,7 @@ void loop() {
     }
     drawCalibDisplay();
   }
-  // 5. 菜单控制
+  // 6. 菜单控制
   else if (inMenu) {
     if (evt == SINGLE_CLICK) {
       menuSelection = (menuSelection + 1) % MENU_ITEMS;
@@ -385,7 +461,7 @@ void loop() {
         inMenu = false;
         markSettingsDirty();
       } else if (menuSelection == 2) {
-        openFreqEditor();            // 手动设置 LoRa 接收频率
+        openPresetManager();         // 预设频率管理
       } else if (menuSelection == 3) {
         inCalibUI = true; // 进入电池校准模式
         targetCalibVoltage = readBatteryVoltage(); // 以当前测得电压为基准
@@ -394,11 +470,11 @@ void loop() {
         powerOff();
       }
     }
-    if (inFreqUI) drawFreqEditDisplay();
+    if (inPresetUI) drawPresetDisplay();
     else if (inCalibUI) drawCalibDisplay();
-    else drawMenuDisplay();
+    else if (inMenu) drawMenuDisplay();
   }
-  // 6. 频谱扫描模式
+  // 7. 频谱扫描模式
   else if (currentMode == MODE_SPECTRUM) {
     if (evt == SINGLE_CLICK) {
       specCenterFreq += 1.0;
@@ -416,7 +492,7 @@ void loop() {
     runSpectrumScan();
     drawSpectrumDisplay();
   }
-  // 7. LoRa 分析模式
+  // 8. LoRa 分析模式
   else {
     if (isLocked) {
       if (evt == LONG_PRESS || evt == SINGLE_CLICK) {
@@ -429,8 +505,8 @@ void loop() {
         applyLoRaConfig();
         markSettingsDirty();
       } else if (evt == LONG_PRESS) {
-        freqIdx = (freqIdx + 1) % FREQ_COUNT;
-        currentFreq = FREQ_LIST[freqIdx];
+        freqIdx = (freqIdx + 1) % presetCount;          // 循环切换预设频率
+        currentFreq = presetKHz[freqIdx] / 1000.0f;
         applyLoRaConfig();
         markSettingsDirty();
       }
@@ -563,7 +639,7 @@ void drawMenuDisplay() {
   display.println("= SELECT MODE =");
   display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
 
-  const char* items[] = {"1. Spectrum Scan", "2. LoRa Receiver", "3. Set LoRa Freq", "4. Calib Battery", "5. Power Off"};
+  const char* items[] = {"1. Spectrum Scan", "2. LoRa Receiver", "3. Freq Presets", "4. Calib Battery", "5. Power Off"};
 
   for (int i = 0; i < MENU_ITEMS; i++) {
     int yPos = 12 + i * 10;
@@ -920,33 +996,75 @@ void loadSettings() {
   uint8_t mode  = prefs.getUChar("mode", (uint8_t)MODE_SPECTRUM);
   uint8_t span  = prefs.getUChar("span", 0);
   float   cen   = prefs.getFloat("cen", 435.0f);
-  uint32_t fkhz = prefs.getUInt("fkhz", (uint32_t)lroundf(FREQ_LIST[0] * 1000.0f));
+  uint32_t fkhz = prefs.getUInt("fkhz", DEFAULT_PRESETS_KHZ[0]);
   uint8_t combo = prefs.getUChar("combo", 0);
   uint8_t fidx  = prefs.getUChar("fidx", 0);
+
+  // 预设频率表
+  uint8_t pc = prefs.getUChar("pcount", 0);
+  bool presetOk = false;
+  if (pc >= 1 && pc <= MAX_PRESETS && prefs.getBytesLength("presets") == sizeof(presetKHz)) {
+    uint32_t tmp[MAX_PRESETS];
+    prefs.getBytes("presets", tmp, sizeof(tmp));
+    presetOk = true;
+    for (int i = 0; i < pc; i++) {
+      if (tmp[i] < FREQ_MIN_KHZ || tmp[i] > FREQ_MAX_KHZ) { presetOk = false; break; }
+    }
+    if (presetOk) {
+      memcpy(presetKHz, tmp, sizeof(presetKHz));
+      presetCount = pc;
+    }
+  }
   prefs.end();
+
+  if (!presetOk) {   // 首次运行或数据异常：使用默认预设
+    memset(presetKHz, 0, sizeof(presetKHz));
+    for (int i = 0; i < DEFAULT_PRESET_COUNT; i++) presetKHz[i] = DEFAULT_PRESETS_KHZ[i];
+    presetCount = DEFAULT_PRESET_COUNT;
+  }
 
   // 合法性检查，避免 Flash 中的异常值导致越界
   currentMode  = (mode == (uint8_t)MODE_LORA_ANALYZER) ? MODE_LORA_ANALYZER : MODE_SPECTRUM;
   spanIdx      = (span < SPAN_COUNT) ? span : 0;
   specCenterFreq = (cen >= 431.0f && cen <= 439.0f) ? cen : 435.0f;
-  if (fkhz < FREQ_MIN_KHZ || fkhz > FREQ_MAX_KHZ) fkhz = (uint32_t)lroundf(FREQ_LIST[0] * 1000.0f);
+  if (fkhz < FREQ_MIN_KHZ || fkhz > FREQ_MAX_KHZ) fkhz = presetKHz[0];
   currentFreq  = fkhz / 1000.0f;
   comboIdx     = (combo < COMBO_COUNT) ? combo : 0;
-  freqIdx      = (fidx < FREQ_COUNT) ? fidx : 0;
+  freqIdx      = (fidx < presetCount) ? fidx : 0;
 
-  Serial.printf("[NVS] Settings loaded: mode=%d span=%d cen=%.1f freq=%.3f combo=%d\n",
-                (int)currentMode, spanIdx, specCenterFreq, currentFreq, comboIdx);
+  Serial.printf("[NVS] Settings loaded: mode=%d span=%d cen=%.1f freq=%.3f combo=%d presets=%d\n",
+                (int)currentMode, spanIdx, specCenterFreq, currentFreq, comboIdx, presetCount);
+}
+
+void savePresets() {
+  prefs.begin("settings", false);
+  prefs.putUChar("pcount", (uint8_t)presetCount);
+  prefs.putBytes("presets", presetKHz, sizeof(presetKHz));
+  prefs.end();
+  Serial.printf("[NVS] Presets saved, count=%d\n", presetCount);
 }
 
 // ================= 手动设置频率 =================
-void openFreqEditor() {
-  uint32_t khz = (uint32_t)lroundf(currentFreq * 1000.0f);
-  freqDigits[0] = (khz / 100000) % 10;
-  freqDigits[1] = (khz / 10000) % 10;
-  freqDigits[2] = (khz / 1000) % 10;
-  freqDigits[3] = (khz / 100) % 10;
-  freqDigits[4] = (khz / 10) % 10;
-  freqDigits[5] = khz % 10;
+void openPresetManager() {
+  uint32_t cur = (uint32_t)lroundf(currentFreq * 1000.0f);
+  presetSel = 0;
+  for (int i = 0; i < presetCount; i++) {
+    if (presetKHz[i] == cur) { presetSel = i; break; }
+  }
+  presetPage = 0;
+  presetActSel = 0;
+  inPresetUI = true;
+  inMenu = false;
+}
+
+void openFreqEditor(int target, uint32_t startKHz) {
+  freqEditTarget = target;
+  freqDigits[0] = (startKHz / 100000) % 10;
+  freqDigits[1] = (startKHz / 10000) % 10;
+  freqDigits[2] = (startKHz / 1000) % 10;
+  freqDigits[3] = (startKHz / 100) % 10;
+  freqDigits[4] = (startKHz / 10) % 10;
+  freqDigits[5] = startKHz % 10;
   freqEditPos = 0;
   inFreqUI = true;
   inMenu = false;
@@ -958,8 +1076,8 @@ static uint32_t freqDigitsToKHz() {
          (uint32_t)freqDigits[4] * 10UL     + (uint32_t)freqDigits[5];
 }
 
-void commitFreq() {
-  uint32_t khz = freqDigitsToKHz();
+// 把频率应用到接收机并进入 LoRa 接收界面
+void applyFreqAndEnterLoRa(uint32_t khz) {
   if (khz < FREQ_MIN_KHZ) khz = FREQ_MIN_KHZ;
   if (khz > FREQ_MAX_KHZ) khz = FREQ_MAX_KHZ;
 
@@ -972,7 +1090,32 @@ void commitFreq() {
   markSettingsDirty();
 
   inFreqUI = false;
+  inPresetUI = false;
   inMenu = false;
+}
+
+void commitFreq() {
+  uint32_t khz = freqDigitsToKHz();
+  if (khz < FREQ_MIN_KHZ) khz = FREQ_MIN_KHZ;
+  if (khz > FREQ_MAX_KHZ) khz = FREQ_MAX_KHZ;
+
+  if (freqEditTarget == -1) {                       // 新建预设
+    if (presetCount < MAX_PRESETS) {
+      presetKHz[presetCount] = khz;
+      presetSel = presetCount;
+      presetCount++;
+      savePresets();
+    }
+    presetPage = 0;
+    inFreqUI = false;
+  } else if (freqEditTarget >= 0 && freqEditTarget < presetCount) {   // 修改预设
+    presetKHz[freqEditTarget] = khz;
+    savePresets();
+    presetPage = 0;
+    inFreqUI = false;
+  } else {                                          // 手动频率：直接应用
+    applyFreqAndEnterLoRa(khz);
+  }
 }
 
 void drawFreqEditDisplay() {
@@ -981,7 +1124,7 @@ void drawFreqEditDisplay() {
   display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
 
   display.setCursor(10, 0);
-  display.print("= SET LORA FREQ =");
+  display.print(freqEditTarget >= 0 ? "= EDIT PRESET =" : (freqEditTarget == -1 ? "= NEW PRESET =" : "= SET LORA FREQ ="));
   display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
 
   // 大号频率显示  XXX.XXX
@@ -1013,7 +1156,7 @@ void drawFreqEditDisplay() {
     display.fillRect(0, 46, 128, 10, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
     display.setCursor(2, 47);
-    display.print("> SAVE & APPLY <");
+    display.print(freqEditTarget >= -1 ? "> SAVE PRESET <" : "> SAVE & APPLY <");
     display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
     display.setCursor(0, 56);
     display.print("Click:Save 2xClk:Esc");
@@ -1022,6 +1165,83 @@ void drawFreqEditDisplay() {
     display.print("Hold: next digit");
     display.setCursor(0, 56);
     display.print("Click:+1  2xClk:-1");
+  }
+
+  display.display();
+}
+
+// ================= 预设频率管理界面 =================
+void drawPresetDisplay() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+
+  if (presetPage == 0) {
+    display.setCursor(16, 0);
+    display.print("= FREQ PRESETS =");
+    display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+
+    int total = presetCount + 2;          // 预设 + 新建 + 手动频率
+    int first = presetSel - 2;            // 选中项尽量居中，最多显示 5 行
+    if (first > total - 5) first = total - 5;
+    if (first < 0) first = 0;
+    uint32_t curKHz = (uint32_t)lroundf(currentFreq * 1000.0f);
+
+    for (int r = 0; r < 5; r++) {
+      int idx = first + r;
+      if (idx >= total) break;
+      int y = 12 + r * 10;
+      if (idx == presetSel) {
+        display.fillRect(0, y, 122, 10, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+      } else {
+        display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+      }
+      display.setCursor(4, y + 1);
+      if (idx < presetCount) {
+        display.printf("%d. %.3f MHz", idx + 1, presetKHz[idx] / 1000.0f);
+        if (presetKHz[idx] == curKHz) {     // 当前正在使用的频率
+          display.setCursor(110, y + 1);
+          display.print("*");
+        }
+      } else if (idx == presetCount) {
+        display.print(presetCount < MAX_PRESETS ? "+ New preset" : "+ New (full)");
+      } else {
+        display.print("~ Manual freq");
+      }
+    }
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+
+    // 右侧滚动条
+    if (total > 5) {
+      int thumbH = max(4, 50 * 5 / total);
+      int thumbY = 12 + (50 - thumbH) * first / (total - 5);
+      display.drawFastVLine(126, 12, 50, SSD1306_WHITE);
+      display.fillRect(125, thumbY, 3, thumbH, SSD1306_WHITE);
+    }
+  } else {
+    char title[24];
+    snprintf(title, sizeof(title), "= %.3f MHz =", presetKHz[presetSel] / 1000.0f);
+    display.setCursor(10, 0);
+    display.print(title);
+    display.drawFastHLine(0, 10, 128, SSD1306_WHITE);
+
+    const char* acts[] = {"1. Use this freq", "2. Edit freq", "3. Delete", "4. Back"};
+    for (int i = 0; i < 4; i++) {
+      int y = 12 + i * 10;
+      if (i == presetActSel) {
+        display.fillRect(5, y, 118, 10, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+      } else {
+        display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+      }
+      display.setCursor(8, y + 1);
+      if (i == 2 && presetCount <= 1) display.print("3. Delete (last)");
+      else display.print(acts[i]);
+    }
+    display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+    display.setCursor(0, 56);
+    display.print("Click:Next Hold:OK");
   }
 
   display.display();
