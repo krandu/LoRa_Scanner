@@ -8,10 +8,27 @@ on:
       - "**.h"
       - "**.cpp"
       - "**.csv"
+      - "docs/**"
       - ".github/workflows/arduino-build.yml"
   pull_request:
     branches: [ "main", "master" ]
   workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: arduino-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SKETCH: LoRa_Scanner/LoRa_Scanner.ino
+  FQBN: esp32:esp32:heltec_wifi_lora_32_V2
+  # esp_adc_cal.h 在 core 3.x 中已被移除，保持和原来一致，固定 2.0.17
+  ESP32_CORE: "2.0.17"
+  ESP32_INDEX: https://espressif.github.io/arduino-esp32/package_esp32_index.json
 
 jobs:
   build:
@@ -25,43 +42,35 @@ jobs:
 
       # ── 2. 安装 arduino-cli ──────────────────────────────────
       - name: Install arduino-cli
-        uses: arduino/setup-arduino-cli@v1
+        uses: arduino/setup-arduino-cli@v2
 
-      # ── 3. 安装 Python 工具（esptool & 下载 spiffsgen.py）────
-      - name: Install Python tools
-        run: |
-          pip install esptool --quiet
-          curl -sSL https://raw.githubusercontent.com/espressif/esp-idf/master/components/spiffs/spiffsgen.py -o /usr/local/bin/spiffsgen.py
-          chmod +x /usr/local/bin/spiffsgen.py
+      # ── 3. 缓存工具链和库（第二次起明显更快）──────────────────
+      - name: Cache Arduino data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15
+            ~/Arduino/libraries
+          key: arduino-${{ env.ESP32_CORE }}-${{ hashFiles('.github/workflows/arduino-build.yml') }}
 
-      # ── 4. 配置 ESP32 官方 Board Manager URL ──────────────────
-      - name: Configure arduino-cli
-        run: |
-          arduino-cli config init
-          arduino-cli config add board_manager.additional_urls \
-            https://espressif.github.io/arduino-esp32/package_esp32_index.json
+      # ── 4. 安装 esptool（用于生成兼容旧流程的 merged-firmware.bin）
+      - name: Install esptool
+        run: pip install esptool --quiet
 
-      # ── 5. 更新索引 & 安装 ESP32 官方 Core (2.0.17 兼容版本) ──
-      - name: Update index and install core
+      # ── 5. 安装 ESP32 Core 和依赖库 ───────────────────────────
+      - name: Install core and libraries
         run: |
-          arduino-cli core update-index
-          arduino-cli core install esp32:esp32@2.0.17
-
-      # ── 6. 安装标准开源依赖库 ─────────────────────────────────
-      - name: Install libraries
-        run: |
+          arduino-cli core update-index --additional-urls "$ESP32_INDEX"
+          arduino-cli core install "esp32:esp32@${ESP32_CORE}" --additional-urls "$ESP32_INDEX"
           arduino-cli lib install "LoRa"
           arduino-cli lib install "Adafruit GFX Library"
           arduino-cli lib install "Adafruit SSD1306"
 
-      # ── 7. 编译项目 ──────────────────────────────────────────
+      # ── 6. 编译项目 ──────────────────────────────────────────
       - name: Compile sketch
         run: |
-          FQBN="esp32:esp32:heltec_wifi_lora_32_V2"
-          echo "FQBN=$FQBN" >> $GITHUB_ENV
-
-          # 覆盖默认分区表（如果存在）
-          PART_DIR=$(find /home/runner/.arduino15/packages/esp32/hardware/esp32/ -type d -name "partitions" | head -1)
+          # 覆盖默认分区表（仅当仓库里有 spiffs/partitions.csv 时，与原流程一致）
+          PART_DIR=$(find "$HOME/.arduino15/packages/esp32/hardware/esp32/" -type d -name "partitions" | head -1)
           if [ -d "$PART_DIR" ] && [ -f "spiffs/partitions.csv" ]; then
             echo "Copying custom partitions.csv to $PART_DIR/default.csv"
             cp spiffs/partitions.csv "$PART_DIR/default.csv"
@@ -72,50 +81,41 @@ jobs:
             --warnings none \
             --export-binaries \
             --output-dir build/ \
-            LoRa_Scanner/LoRa_Scanner.ino
+            "$SKETCH"
 
-      # ── 8. 生成 SPIFFS 镜像 ──────────────────────────────────
-      - name: Generate SPIFFS image
+      # ── 7. 定位各分区文件 ────────────────────────────────────
+      - name: Locate firmware parts
         run: |
-          mkdir -p spiffs_data
-          if [ -d "spiffs" ]; then
-            rsync -av --exclude='partitions.csv' spiffs/ spiffs_data/ || true
-          fi
-          python3 /usr/local/bin/spiffsgen.py \
-            1572864 \
-            spiffs_data/ \
-            build/spiffs.bin \
-            --page-size 256 \
-            --block-size 4096
-          echo "SPIFFS image created."
-
-      # ── 9. 智能搜索并合并固件 (兼容 esptool v5+ 语法) ───────────
-      - name: Merge firmware (merged-firmware.bin)
-        run: |
-          # 优先在 build/ 目录精准匹配 arduino-cli 导出的当前板子 bootloader
           BOOT=$(find build/ -name "*.bootloader.bin" | head -1)
-          
-          # 如果 build/ 下没找到，再降级去查找 esp32 默认的标准 bootloader
           if [ -z "$BOOT" ]; then
-            BOOT=$(find /home/runner/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/sdk/esp32/bin/ -name "bootloader_*.bin" | head -1)
+            BOOT=$(find "$HOME/.arduino15/packages/esp32/hardware/esp32/${ESP32_CORE}/tools/sdk/esp32/bin/" -name "bootloader_*.bin" | head -1)
           fi
-
           PART=$(find build/ -name "*.partitions.bin" -o -name "partitions.bin" | head -1)
-          BAPP=$(find /home/runner/.arduino15/ -name "boot_app0.bin" | head -1)
+          BAPP=$(find "$HOME/.arduino15/" -name "boot_app0.bin" | head -1)
           APP=$(find build/ -name "*.ino.bin" ! -name "*bootloader*" ! -name "*partitions*" | head -1)
 
           echo "Found bootloader : $BOOT"
           echo "Found partitions : $PART"
           echo "Found boot_app0  : $BAPP"
           echo "Found app        : $APP"
-          echo "Found spiffs     : build/spiffs.bin"
 
           if [ -z "$BOOT" ] || [ -z "$PART" ] || [ -z "$BAPP" ] || [ -z "$APP" ]; then
-            echo "Error: Could not locate all required bin files for merging."
+            echo "Error: Could not locate all required bin files."
             exit 1
           fi
 
-          # 注意：esptool v5 要求 --chip 等参数写在 merge-bin 子命令之前
+          {
+            echo "BOOT=$BOOT"
+            echo "PART=$PART"
+            echo "BAPP=$BAPP"
+            echo "APP=$APP"
+          } >> "$GITHUB_ENV"
+
+      # ── 8. 兼容旧流程：合并固件（flash tool 写入 0x0）────────────
+      # 注意：合并固件覆盖 0x0 起的整段区域，会清掉 NVS（电池校准、保存的设置）。
+      # 日常刷机建议用在线刷机页面（分段写入，不碰 NVS）。
+      - name: Merge firmware (merged-firmware.bin)
+        run: |
           esptool --chip esp32 \
             merge-bin \
             --output build/merged-firmware.bin \
@@ -125,18 +125,69 @@ jobs:
             0x1000   "$BOOT" \
             0x8000   "$PART" \
             0xe000   "$BAPP" \
-            0x10000  "$APP" \
-            0x670000 build/spiffs.bin
-
+            0x10000  "$APP"
           ls -lh build/merged-firmware.bin
 
-      # ── 10. 上传产物 ─────────────────────────────────────────
+      # ── 9. 生成在线刷机页面 ──────────────────────────────────
+      - name: Prepare web flasher
+        run: |
+          mkdir -p site
+          cp "$BOOT" site/bootloader.bin
+          cp "$PART" site/partitions.bin
+          cp "$BAPP" site/boot_app0.bin
+          cp "$APP"  site/app.bin
+          cp docs/index.html site/index.html
+
+          VERSION="$(date -u +%Y%m%d-%H%M)-${GITHUB_SHA::7}"
+          cat > site/manifest.json <<MANIFEST
+          {
+            "name": "Heltec LoRa Spectrum",
+            "version": "${VERSION}",
+            "new_install_prompt_erase": false,
+            "builds": [
+              {
+                "chipFamily": "ESP32",
+                "parts": [
+                  { "path": "bootloader.bin", "offset": 4096 },
+                  { "path": "partitions.bin", "offset": 32768 },
+                  { "path": "boot_app0.bin",  "offset": 57344 },
+                  { "path": "app.bin",        "offset": 65536 }
+                ]
+              }
+            ]
+          }
+          MANIFEST
+          echo "$VERSION" > site/version.txt
+          cat site/manifest.json
+
+      # ── 10. 上传产物（保留旧的 merged-firmware.bin）─────────────
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
           name: LoRa_Scanner-firmware
           path: |
             build/merged-firmware.bin
-            build/spiffs.bin
             build/*.bin
           retention-days: 30
+
+      - name: Setup Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: Publish web flasher
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
